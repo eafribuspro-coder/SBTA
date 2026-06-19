@@ -1,0 +1,2395 @@
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { supabase } from '../../services/supabase';
+import { useAuthStore } from '../../store/authStore';
+import toast from 'react-hot-toast';
+import {
+  Search, MapPin, ChevronRight, Bus, Users, Calendar,
+  User, Phone, CreditCard, CheckCircle, Printer, ArrowLeft,
+  Banknote, Smartphone, RefreshCw, Clock, AlertCircle, Tag,
+  LayoutGrid, WifiOff, List, LogIn, LogOut, Luggage, ChevronDown, ChevronUp,
+} from 'lucide-react';
+import { format } from 'date-fns';
+import { fr } from 'date-fns/locale';
+import { formatCurrency } from '../../utils/formatCurrency';
+import { QRCodeSVG } from 'qrcode.react';
+import jsPDF from 'jspdf';
+import { useSeatMap } from '../../hooks/useSeatMap';
+import { BusSeatMapPanel } from '../../components/bus/BusSeatMapPanel';
+import { isSeatStillAvailable } from '../../services/seatMap.service';
+import type { EnrichedSeat } from '../../types/seatMap.types';
+import { useOnlineStatus } from '../../hooks/useOnlineStatus';
+import { useOfflineTickets } from '../../hooks/useOfflineTickets';
+import { offlineStore, type CachedSchedule } from '../../services/offlineStore';
+import { offlineSyncService } from '../../services/offlineSync';
+import OfflineBanner from '../../components/guichetier/OfflineBanner';
+import OfflineQueue from '../../components/guichetier/OfflineQueue';
+import { printBaggageTicket, generateBaggageNumber, type BaggageTicketData } from '../../utils/printBaggageTicket';
+
+interface City { id: string; name: string; }
+interface Station { id: string; name: string; city_id: string; }
+
+interface Schedule {
+  id: string;
+  route_name: string;
+  departure_datetime: string;
+  arrival_datetime: string;
+  price: number;
+  seats_available: number;
+  seats_reserved: number;
+  estimated_duration_minutes: number | null;
+  notes: string | null;
+  bus_id: string;
+  buses: {
+    registration_number: string;
+    total_seats: number;
+    class: string;
+    model: string | null;
+    brand: string | null;
+    seat_config_id: string | null;
+  };
+  route: {
+    id: string;
+    name: string;
+    origin_city_id: string;
+    destination_city_id: string;
+    distance_km: number | null;
+    base_price: number | null;
+  };
+  origin_city_name: string;
+  destination_city_name: string;
+}
+
+interface ConfirmedTicket {
+  booking_reference: string;
+  passenger_name: string;
+  passenger_phone: string;
+  seat_numbers: string[];
+  total_price: number;
+  payment_method: string;
+  schedule: Schedule;
+  payment_reference?: string;
+  change_amount?: number;
+  savedOffline?: boolean;
+  boarding_station?: string;
+  alighting_station?: string;
+  departure_number?: number | null;
+}
+
+type Step = 'search' | 'select' | 'seats' | 'confirm';
+
+const STEPS: { id: Step; label: string }[] = [
+  { id: 'search', label: 'Recherche' },
+  { id: 'select', label: 'Voyage' },
+  { id: 'seats', label: 'Vente' },
+  { id: 'confirm', label: 'Confirmation' },
+];
+
+const BUS_CLASS_LABELS: Record<string, string> = {
+  standard: 'Standard',
+  vip: 'VIP',
+  executive: 'Executive',
+};
+
+const PAYMENT_METHODS = [
+  { value: 'especes', label: 'Espèces', icon: <Banknote className="w-6 h-6" /> },
+  { value: 'mobile_money', label: 'Mobile Money', icon: <Smartphone className="w-6 h-6" /> },
+  { value: 'carte', label: 'Carte bancaire', icon: <CreditCard className="w-6 h-6" /> },
+  { value: 'virement', label: 'Virement', icon: <RefreshCw className="w-6 h-6" /> },
+];
+
+export default function TicketSale() {
+  const { user } = useAuthStore();
+  const { isOnline, wasOffline } = useOnlineStatus();
+  const { tickets, pendingCount, syncing, syncNow, deleteTicket, reload: reloadOfflineTickets } = useOfflineTickets();
+  const [showQueue, setShowQueue] = useState(false);
+
+  // Server time sync: offset between local clock and server clock
+  const serverOffsetRef = useRef(0);
+  const getServerNow = useCallback(() => new Date(Date.now() + serverOffsetRef.current), []);
+  const [now, setNow] = useState(() => new Date());
+  const [driftWarning, setDriftWarning] = useState(false);
+  const [step, setStep] = useState<Step>('search');
+  const [cities, setCities] = useState<City[]>([]);
+  const [schedules, setSchedules] = useState<Schedule[]>([]);
+  const [selectedSchedule, setSelectedSchedule] = useState<Schedule | null>(null);
+  const [seatCount, setSeatCount] = useState(1);
+  const {
+    seatMap,
+    isLoading: seatMapLoading,
+    error: seatMapError,
+    selectedSeats: enrichedSelectedSeats,
+    toggleSeat,
+    clearSelection: clearSeatSelection,
+    totalSelectedPrice,
+    refresh,
+    lockCountdowns,
+  } = useSeatMap({
+    scheduleId: selectedSchedule?.id ?? null,
+    enableRealtime: isOnline && step === 'seats',
+  });
+
+  const hasSeatMap = !seatMapLoading && !!seatMap;
+  const selectedSeats = enrichedSelectedSeats.map(s => s.label);
+
+  const [loadingSchedules, setLoadingSchedules] = useState(false);
+  const [processing, setProcessing] = useState(false);
+  const [confirmedTicket, setConfirmedTicket] = useState<ConfirmedTicket | null>(null);
+  const printRef = useRef<HTMLDivElement>(null);
+  const [myCounterId, setMyCounterId] = useState<string | null>(null);
+  const [myStationId, setMyStationId] = useState<string | null>(null);
+  const [myCityId, setMyCityId] = useState<string | null>(null);
+  const [myStationName, setMyStationName] = useState<string | null>(null);
+  const [assignedDestCityIds, setAssignedDestCityIds] = useState<string[] | null>(null);
+
+  const [search, setSearch] = useState({
+    origin_city_id: '',
+    destination_city_id: '',
+    date: format(new Date(), 'yyyy-MM-dd'),
+  });
+
+  const [passenger, setPassenger] = useState({
+    name: '',
+    phone: '',
+    id_number: '',
+  });
+
+  const [boardingStationId, setBoardingStationId] = useState('');
+  const [alightingStationId, setAlightingStationId] = useState('');
+  const [boardingStations, setBoardingStations] = useState<Station[]>([]);
+  const [alightingStations, setAlightingStations] = useState<Station[]>([]);
+
+  const [payment, setPayment] = useState({
+    method: '' as 'especes' | 'carte' | 'mobile_money' | 'virement' | '',
+    amount_received: 0,
+    reference: '',
+    mobile_provider: '',
+  });
+
+  const [showBaggage, setShowBaggage] = useState(false);
+  type BaggageMode = 'none' | 'avec_ticket' | 'avec_ticket_reporte' | 'sans_ticket';
+  const [baggageForm, setBaggageForm] = useState<{
+    mode: BaggageMode;
+    has_ticket: boolean;
+    destination: string;
+    price: number;
+    seat_number: string;
+    departure_number: string;
+    bus_registration: string;
+    description: string;
+    owner_name: string;
+    owner_phone: string;
+  }>({
+    mode: 'none',
+    has_ticket: false,
+    destination: '',
+    price: 0,
+    seat_number: '',
+    departure_number: '',
+    bus_registration: '',
+    description: '',
+    owner_name: '',
+    owner_phone: '',
+  });
+
+  useEffect(() => {
+    supabase.auth.getUser().then(async ({ data: { user: u } }) => {
+      if (!u) return;
+      const { data } = await supabase.from('counters')
+        .select('id, station_id, stations:station_id(name, city_id)')
+        .eq('assigned_user_id', u.id)
+        .maybeSingle();
+      if (!data) return;
+      setMyCounterId(data.id);
+      setMyStationId(data.station_id);
+      const st = data.stations as any;
+      if (st?.city_id) {
+        setMyCityId(st.city_id);
+        setMyStationName(st.name ?? null);
+        setSearch(prev => ({ ...prev, origin_city_id: st.city_id }));
+      }
+      const { data: crData } = await supabase
+        .from('counter_routes')
+        .select('route_id, routes:route_id(destination_city_id)')
+        .eq('counter_id', data.id);
+      if (crData && crData.length > 0) {
+        const destIds = [...new Set(crData.map((cr: any) => (cr.routes as any)?.destination_city_id).filter(Boolean))];
+        setAssignedDestCityIds(destIds as string[]);
+      }
+    });
+
+    loadCities();
+    const stopSync = offlineSyncService.startAutoSync(30_000);
+
+    // Sync server time offset on mount and periodically
+    const syncServerTime = async () => {
+      try {
+        const before = Date.now();
+        const { data, error } = await supabase.rpc('get_server_time');
+        const after = Date.now();
+        if (!error && data) {
+          const serverMs = new Date(data).getTime();
+          const roundTripMs = after - before;
+          const estimatedServerNow = serverMs + roundTripMs / 2;
+          serverOffsetRef.current = estimatedServerNow - after;
+          const driftSec = Math.abs(serverOffsetRef.current / 1000);
+          setDriftWarning(driftSec > 300);
+        }
+      } catch (_) {}
+    };
+    syncServerTime();
+    const serverSyncTimer = setInterval(syncServerTime, 60_000);
+
+    // Horloge 1 s basée sur l'heure serveur
+    const clockTimer = setInterval(() => setNow(new Date(Date.now() + serverOffsetRef.current)), 1000);
+
+    // Toutes les 30 s, déclencher la transition planifie → en_cours en DB
+    const transitionTimer = setInterval(async () => {
+      try {
+        await supabase.rpc('auto_transition_departed_schedules');
+      } catch (_) {}
+    }, 30_000);
+
+    // Appel immédiat au montage
+    supabase.rpc('auto_transition_departed_schedules').then(() => {}).catch(() => {});
+
+    return () => {
+      stopSync();
+      clearInterval(clockTimer);
+      clearInterval(transitionTimer);
+      clearInterval(serverSyncTimer);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (isOnline && pendingCount > 0) {
+      syncNow();
+    }
+  }, [isOnline]);
+
+  // Realtime: refresh seats_available when any displayed schedule changes
+  const schedulesRef = useRef(schedules);
+  schedulesRef.current = schedules;
+  const selectedScheduleRef = useRef(selectedSchedule);
+  selectedScheduleRef.current = selectedSchedule;
+
+  useEffect(() => {
+    if (!isOnline || schedules.length === 0) return;
+
+    const channel = supabase
+      .channel('guichetier-schedule-seats')
+      .on('postgres_changes', {
+        event: 'UPDATE',
+        schema: 'public',
+        table: 'schedules',
+      }, (payload: any) => {
+        const updated = payload.new;
+        if (!updated) return;
+        const current = schedulesRef.current;
+        const busIds = new Set(current.map(s => s.bus_id));
+        const scheduleIds = new Set(current.map(s => s.id));
+
+        if (scheduleIds.has(updated.id) || busIds.has(updated.bus_id)) {
+          setSchedules(prev => prev.map(s => {
+            if (s.id === updated.id || (s.bus_id === updated.bus_id && s.departure_datetime === updated.departure_datetime)) {
+              return { ...s, seats_available: updated.seats_available, seats_reserved: updated.seats_reserved };
+            }
+            return s;
+          }));
+          const sel = selectedScheduleRef.current;
+          if (sel && (sel.id === updated.id || (sel.bus_id === updated.bus_id && sel.departure_datetime === updated.departure_datetime))) {
+            setSelectedSchedule(prev => prev ? { ...prev, seats_available: updated.seats_available, seats_reserved: updated.seats_reserved } : prev);
+          }
+        }
+      })
+      .subscribe();
+
+    return () => { supabase.removeChannel(channel); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOnline, schedules.length]);
+
+  const loadCities = async () => {
+    try {
+      const { data } = await supabase
+        .from('cities')
+        .select('id, name')
+        .eq('is_active', true)
+        .order('name');
+      if (data && data.length > 0) {
+        setCities(data);
+        await offlineStore.cacheCities(data);
+        return;
+      }
+    } catch (_) {}
+    const cached = await offlineStore.getCachedCities();
+    setCities(cached);
+    if (cached.length === 0 && !isOnline) {
+      toast('Mode hors-ligne : villes non disponibles. Connectez-vous une fois pour charger les données.', { icon: '📡' });
+    }
+  };
+
+  const handleSearch = async () => {
+    if (!search.origin_city_id || !search.destination_city_id) {
+      toast.error('Sélectionnez les villes de départ et d\'arrivée');
+      return;
+    }
+    if (search.origin_city_id === search.destination_city_id) {
+      toast.error('Les villes de départ et d\'arrivée doivent être différentes');
+      return;
+    }
+
+    setLoadingSchedules(true);
+    try {
+      await searchOnline();
+    } catch (_) {
+      try {
+        await searchOffline();
+      } catch (err: any) {
+        toast.error('Impossible de rechercher des voyages');
+      }
+    } finally {
+      setLoadingSchedules(false);
+    }
+  };
+
+  const searchOnline = async () => {
+    const startOfDay = `${search.date}T00:00:00+00:00`;
+    const endOfDay = `${search.date}T23:59:59+00:00`;
+
+    const { data: routeData, error: routeError } = await supabase
+      .from('routes')
+      .select('id, name, origin_city_id, destination_city_id, distance_km, base_price')
+      .eq('origin_city_id', search.origin_city_id)
+      .eq('destination_city_id', search.destination_city_id)
+      .eq('is_active', true);
+
+    if (routeError) throw routeError;
+    if (!routeData || routeData.length === 0) {
+      setSchedules([]);
+      setStep('select');
+      return;
+    }
+
+    const routeIds = routeData.map(r => r.id);
+
+    const { data, error } = await supabase
+      .from('schedules')
+      .select(`
+        id, route_name, departure_datetime, arrival_datetime,
+        price, seats_available, seats_reserved, estimated_duration_minutes, notes,
+        route_id, bus_id,
+        buses:bus_id(registration_number, total_seats, class, model, brand, seat_config_id)
+      `)
+      .in('route_id', routeIds)
+      .in('status', ['planifie', 'en_cours'])
+      .gte('departure_datetime', startOfDay)
+      .lte('departure_datetime', endOfDay)
+      .order('departure_datetime');
+
+    if (error) throw error;
+
+    // Filter to only schedules on routes assigned to this guichetier's counter
+    let filteredData = data || [];
+    if (myCounterId && filteredData.length > 0) {
+      const { data: assignedRoutes } = await supabase
+        .from('counter_routes')
+        .select('route_id')
+        .eq('counter_id', myCounterId);
+      const assignedRouteIds = new Set((assignedRoutes || []).map((r: any) => r.route_id));
+      filteredData = filteredData.filter((s: any) => assignedRouteIds.has(s.route_id));
+    } else if (!myCounterId) {
+      filteredData = [];
+    }
+
+    const routeMap = Object.fromEntries(routeData.map(r => [r.id, r]));
+    const originCityName = cities.find(c => c.id === search.origin_city_id)?.name || '';
+    const destCityName = cities.find(c => c.id === search.destination_city_id)?.name || '';
+
+    const enriched: Schedule[] = filteredData.map((s: any) => {
+      const route = routeMap[s.route_id];
+      return {
+        ...s,
+        price: s.price ?? route?.base_price ?? 0,
+        route,
+        origin_city_name: originCityName,
+        destination_city_name: destCityName,
+      };
+    });
+
+    setSchedules(enriched);
+    setStep('select');
+
+    const toCache: CachedSchedule[] = enriched.map(s => ({
+      id: s.id,
+      cachedAt: new Date().toISOString(),
+      route_name: s.route_name,
+      departure_datetime: s.departure_datetime,
+      arrival_datetime: s.arrival_datetime,
+      price: s.price,
+      seats_available: s.seats_available,
+      seats_reserved: s.seats_reserved,
+      estimated_duration_minutes: s.estimated_duration_minutes,
+      notes: s.notes,
+      bus_id: s.bus_id,
+      buses: s.buses,
+      route: s.route,
+      origin_city_name: originCityName,
+      destination_city_name: destCityName,
+    }));
+    await offlineStore.cacheSchedules(toCache);
+  };
+
+  const searchOffline = async () => {
+    const cached = await offlineStore.getCachedSchedules();
+    const originCityName = cities.find(c => c.id === search.origin_city_id)?.name || '';
+    const destCityName = cities.find(c => c.id === search.destination_city_id)?.name || '';
+
+    const filtered = cached.filter(s => {
+      const depDate = s.departure_datetime.split('T')[0];
+      const matchDate = depDate === search.date;
+      const matchOrigin = s.origin_city_name === originCityName;
+      const matchDest = s.destination_city_name === destCityName;
+      return matchDate && matchOrigin && matchDest;
+    });
+
+    const enriched: Schedule[] = filtered.map(s => ({
+      id: s.id,
+      route_name: s.route_name,
+      departure_datetime: s.departure_datetime,
+      arrival_datetime: s.arrival_datetime,
+      price: s.price,
+      seats_available: s.seats_available,
+      seats_reserved: s.seats_reserved,
+      estimated_duration_minutes: s.estimated_duration_minutes,
+      notes: s.notes,
+      bus_id: s.bus_id,
+      buses: s.buses,
+      route: s.route,
+      origin_city_name: s.origin_city_name,
+      destination_city_name: s.destination_city_name,
+    }));
+
+    if (enriched.length === 0) {
+      toast('Aucun voyage en cache pour cette date/itinéraire. Connectez-vous pour actualiser.', { icon: '📡' });
+    }
+
+    setSchedules(enriched);
+    setStep('select');
+  };
+
+  const loadStationsForCities = async (originCityId: string, destCityId: string) => {
+    try {
+      const { data } = await supabase
+        .from('stations')
+        .select('id, name, city_id')
+        .in('city_id', [originCityId, destCityId])
+        .eq('is_active', true)
+        .order('name');
+      if (data) {
+        setBoardingStations(data.filter(s => s.city_id === originCityId));
+        setAlightingStations(data.filter(s => s.city_id === destCityId));
+      }
+    } catch (_) {
+      setBoardingStations([]);
+      setAlightingStations([]);
+    }
+  };
+
+  const handleSelectSchedule = async (schedule: Schedule) => {
+    const serverNow = getServerNow();
+    if (new Date(schedule.departure_datetime) <= serverNow) {
+      toast.error('Vente impossible : la date de vente doit correspondre à la date système serveur.');
+      return;
+    }
+    if (schedule.seats_available === 0) {
+      toast.error('Ce voyage est complet');
+      return;
+    }
+    setSelectedSchedule(schedule);
+    clearSeatSelection();
+    setSeatCount(1);
+    setAlightingStationId('');
+    if (schedule.route?.origin_city_id && schedule.route?.destination_city_id) {
+      await loadStationsForCities(schedule.route.origin_city_id, schedule.route.destination_city_id);
+    }
+    setBoardingStationId(myStationId ?? '');
+    setStep('seats');
+  };
+
+  const handleSeatsConfirm = () => {
+    // no-op: confirmation is done inline via handleConfirmSale
+  };
+
+  const effectiveSeatCount = hasSeatMap ? enrichedSelectedSeats.length : seatCount;
+  const totalAmount = hasSeatMap
+    ? (totalSelectedPrice > 0 ? totalSelectedPrice : (selectedSchedule ? selectedSchedule.price * Math.max(1, effectiveSeatCount) : 0))
+    : (selectedSchedule ? selectedSchedule.price * Math.max(1, effectiveSeatCount) : 0);
+  const changeAmount = payment.method === 'especes' ? Math.max(0, payment.amount_received - totalAmount) : 0;
+
+  const validateSaleInputs = (): boolean => {
+    if (!selectedSchedule) return false;
+    if (hasSeatMap) {
+      if (enrichedSelectedSeats.length === 0) { toast.error('Sélectionnez au moins un siège'); return false; }
+      if (enrichedSelectedSeats.length > selectedSchedule.seats_available) {
+        toast.error(`Seulement ${selectedSchedule.seats_available} place(s) disponible(s)`);
+        return false;
+      }
+    } else {
+      if (seatCount < 1) { toast.error('Sélectionnez au moins 1 siège'); return false; }
+      if (seatCount > selectedSchedule.seats_available) {
+        toast.error(`Seulement ${selectedSchedule.seats_available} place(s) disponible(s)`);
+        return false;
+      }
+    }
+    if (!passenger.phone.trim()) { toast.error('Le téléphone du passager est requis'); return false; }
+    if (!payment.method) { toast.error('Sélectionnez un mode de paiement'); return false; }
+    if (payment.method === 'especes' && payment.amount_received < totalAmount) {
+      toast.error('Montant insuffisant'); return false;
+    }
+    return true;
+  };
+
+  const buildSeatNumbers = (): string[] => {
+    if (hasSeatMap) {
+      return enrichedSelectedSeats.map(s => s.label);
+    }
+    const existing = selectedSchedule?.seats_reserved || 0;
+    return Array.from({ length: seatCount }, (_, i) => `${existing + i + 1}`);
+  };
+
+  const boardingStationName = boardingStations.find(s => s.id === boardingStationId)?.name;
+  const alightingStationName = alightingStations.find(s => s.id === alightingStationId)?.name;
+
+  const handleConfirmSale = async () => {
+    if (!validateSaleInputs()) return;
+    if (!selectedSchedule) return;
+
+    setProcessing(true);
+
+    // Server-side timestamp & fraud validation (online only)
+    if (isOnline) {
+      try {
+        const apiUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/validate-ticket-sale`;
+        const { data: { session } } = await supabase.auth.getSession();
+        const token = session?.access_token;
+
+        const validationRes = await fetch(apiUrl, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json',
+            'apikey': import.meta.env.VITE_SUPABASE_ANON_KEY,
+          },
+          body: JSON.stringify({
+            schedule_id: selectedSchedule.id,
+            counter_id: myCounterId,
+            station_id: myStationId,
+            client_timestamp: new Date().toISOString(),
+          }),
+        });
+
+        const validationData = await validationRes.json();
+
+        if (!validationData.allowed) {
+          toast.error(validationData.reason || 'Vente impossible : la date de vente doit correspondre à la date système serveur.');
+          setProcessing(false);
+          return;
+        }
+
+        if (validationData.drift_warning) {
+          toast('Attention : un decalage d\'horloge a ete detecte sur votre poste.', { icon: '⚠️', duration: 5000 });
+        }
+      } catch (validationErr) {
+        // If validation endpoint is unreachable, fall back to RPC check
+        try {
+          const { data: serverTimeData } = await supabase.rpc('get_server_time');
+          if (serverTimeData) {
+            const serverNow = new Date(serverTimeData);
+            const departure = new Date(selectedSchedule.departure_datetime);
+            if (departure <= serverNow) {
+              toast.error('Vente impossible : la date de vente doit correspondre à la date système serveur.');
+              setProcessing(false);
+              return;
+            }
+          }
+        } catch (_) {}
+      }
+    }
+
+    // Seat availability check (online + seat map)
+    if (isOnline && hasSeatMap && enrichedSelectedSeats.length > 0) {
+      const checks = await Promise.all(
+        enrichedSelectedSeats.map(s => isSeatStillAvailable(selectedSchedule.id, s.id))
+      );
+      const conflictIdx = checks.findIndex(ok => !ok);
+      if (conflictIdx !== -1) {
+        const taken = enrichedSelectedSeats[conflictIdx];
+        toast.error(`Le siège ${taken.label} vient d'être réservé. Veuillez en choisir un autre.`);
+        await refresh();
+        setStep('seats');
+        setProcessing(false);
+        return;
+      }
+    }
+
+    const serverNow = getServerNow();
+    const reference = `SBTA-${serverNow.getFullYear()}-${Math.random().toString(36).substr(2, 8).toUpperCase()}`;
+    const seatNumbers = buildSeatNumbers();
+    const count = seatNumbers.length;
+    try {
+      await confirmOnline(reference, seatNumbers, count);
+    } catch (_) {
+      try {
+        await confirmOffline(reference, seatNumbers, count);
+      } catch (offlineErr: any) {
+        toast.error('Impossible de sauvegarder le billet');
+        setProcessing(false);
+        return;
+      }
+    } finally {
+      setProcessing(false);
+    }
+  };
+
+  const confirmOnline = async (reference: string, seatNumbers: string[], count: number) => {
+    if (!selectedSchedule) return;
+
+    const { data: reservation, error: resError } = await supabase
+      .from('reservations')
+      .insert({
+        schedule_id: selectedSchedule.id,
+        passenger_name: passenger.name.trim(),
+        passenger_phone: passenger.phone.trim(),
+        seat_numbers: seatNumbers,
+        total_seats: count,
+        total_price: totalAmount,
+        booking_reference: reference,
+        qr_code: reference,
+        status: 'confirmee',
+        payment_status: payment.method === 'especes' || payment.method === 'carte' ? 'payee' : 'en_attente',
+        booked_by: user?.id,
+      })
+      .select()
+      .single();
+
+    if (resError) throw resError;
+
+    await supabase.from('payments').insert({
+      reservation_id: reservation.id,
+      amount: totalAmount,
+      payment_method: payment.method,
+      payment_reference: payment.reference || null,
+      status: payment.method === 'especes' || payment.method === 'carte' ? 'reussie' : 'en_attente',
+      processed_by: user?.id,
+    });
+
+    await supabase
+      .from('schedules')
+      .update({
+        seats_available: Math.max(0, selectedSchedule.seats_available - count),
+        seats_reserved: (selectedSchedule.seats_reserved || 0) + count,
+      })
+      .eq('id', selectedSchedule.id);
+
+    // Récupérer le numéro d'ordre défini par le chef de gare (departure_order, unique par gare/date)
+    let departureNumber: number | null = null;
+    try {
+      const { data: existing } = await supabase
+        .from('departure_sequence')
+        .select('departure_order, departure_number')
+        .eq('schedule_id', selectedSchedule.id)
+        .maybeSingle();
+      if (existing) {
+        departureNumber = existing.departure_order ?? existing.departure_number ?? null;
+      }
+    } catch (_) {}
+
+    setConfirmedTicket({
+      booking_reference: reference,
+      passenger_name: passenger.name,
+      passenger_phone: passenger.phone,
+      seat_numbers: seatNumbers,
+      total_price: totalAmount,
+      payment_method: payment.method,
+      schedule: selectedSchedule,
+      payment_reference: payment.reference || undefined,
+      change_amount: changeAmount,
+      savedOffline: false,
+      boarding_station: boardingStationName,
+      alighting_station: alightingStationName,
+      departure_number: departureNumber,
+    });
+
+    setStep('confirm');
+    toast.success('Billet vendu avec succès !');
+  };
+
+  const confirmOffline = async (reference: string, seatNumbers: string[], count: number) => {
+    if (!selectedSchedule || !user) return;
+
+    await offlineStore.saveTicket({
+      localId: `offline-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`,
+      createdAt: new Date().toISOString(),
+      status: 'pending',
+      scheduleId: selectedSchedule.id,
+      scheduleSnapshot: {
+        route_name: selectedSchedule.route_name,
+        departure_datetime: selectedSchedule.departure_datetime,
+        arrival_datetime: selectedSchedule.arrival_datetime,
+        price: selectedSchedule.price,
+        seats_available: selectedSchedule.seats_available,
+        seats_reserved: selectedSchedule.seats_reserved,
+        bus_registration: selectedSchedule.buses?.registration_number || '',
+      },
+      passengerName: passenger.name.trim(),
+      passengerPhone: passenger.phone.trim(),
+      seatNumbers,
+      totalSeats: count,
+      totalPrice: totalAmount,
+      paymentMethod: payment.method,
+      paymentReference: payment.reference || undefined,
+      bookingReference: reference,
+      bookedBy: user.id,
+      changeAmount: changeAmount > 0 ? changeAmount : undefined,
+    });
+
+    await offlineStore.decrementCachedScheduleSeats(selectedSchedule.id, count);
+
+    const updatedSchedules = schedules.map(s =>
+      s.id === selectedSchedule.id
+        ? { ...s, seats_available: Math.max(0, s.seats_available - count), seats_reserved: (s.seats_reserved || 0) + count }
+        : s
+    );
+    setSchedules(updatedSchedules);
+
+    // Récupérer le numéro d'ordre défini par le chef de gare
+    let departureNumberOffline: number | null = null;
+    try {
+      const { data: ds } = await supabase
+        .from('departure_sequence')
+        .select('departure_order, departure_number')
+        .eq('schedule_id', selectedSchedule.id)
+        .maybeSingle();
+      if (ds) {
+        departureNumberOffline = ds.departure_order ?? ds.departure_number ?? null;
+      }
+    } catch (_) {}
+
+    setConfirmedTicket({
+      booking_reference: reference,
+      passenger_name: passenger.name,
+      passenger_phone: passenger.phone,
+      seat_numbers: seatNumbers,
+      total_price: totalAmount,
+      payment_method: payment.method,
+      schedule: selectedSchedule,
+      payment_reference: payment.reference || undefined,
+      change_amount: changeAmount,
+      savedOffline: true,
+      boarding_station: boardingStationName,
+      alighting_station: alightingStationName,
+      departure_number: departureNumberOffline,
+    });
+
+    await reloadOfflineTickets();
+    setStep('confirm');
+    toast.success('Billet sauvegardé hors-ligne ! Il sera synchronisé au retour du réseau.');
+  };
+
+  const generatePDF = async () => {
+    if (!confirmedTicket) return;
+
+    // Use plain ASCII formatting — jsPDF cannot render Unicode narrow no-break spaces (U+202F)
+    // produced by fr-FR locale, which appear as '/' in output.
+    const formatAmount = (n: number): string => {
+      const str = Math.round(n).toString();
+      let result = '';
+      for (let i = 0; i < str.length; i++) {
+        if (i > 0 && (str.length - i) % 3 === 0) result += ' ';
+        result += str[i];
+      }
+      return result + ' f';
+    };
+
+    const depDate = format(new Date(confirmedTicket.schedule.departure_datetime), 'dd/MM/yyyy');
+    const depTime = format(new Date(confirmedTicket.schedule.departure_datetime), 'HH:mm');
+    const origin = (confirmedTicket.schedule.origin_city_name || '').toUpperCase();
+    const dest = (confirmedTicket.schedule.destination_city_name || '').toUpperCase();
+    const tarif = formatAmount(confirmedTicket.total_price);
+    const busReg = confirmedTicket.schedule.buses?.registration_number || '--';
+    const printDt = format(new Date(), 'dd/MM/yyyy HH:mm:ss');
+
+    const refFull = confirmedTicket.booking_reference;
+    const departureNum = confirmedTicket.departure_number ?? '';
+
+    const allSeats = confirmedTicket.seat_numbers;
+    const seatsDisplay = allSeats.join(', ');
+
+    const W = 80;
+    // Layout constants — fixed split between left and right columns
+    const L = 4;    // left margin
+    const R = 76;   // right edge
+    const MID = 46; // column split x (vertical divider on DEPART row)
+
+    const doc = new jsPDF({ unit: 'mm', format: [W, 252] });
+
+    const dashed = (y: number, x1 = L, x2 = R) => {
+      doc.setLineDashPattern([1.2, 1.0], 0);
+      doc.setDrawColor(0, 0, 0);
+      doc.setLineWidth(0.3);
+      doc.line(x1, y, x2, y);
+      doc.setLineDashPattern([], 0);
+    };
+    const solid = (y: number, x1 = L, x2 = R) => {
+      doc.setDrawColor(0, 0, 0);
+      doc.setLineWidth(0.3);
+      doc.line(x1, y, x2, y);
+    };
+    const heavyDotted = (y: number) => {
+      doc.setLineDashPattern([1.5, 1.0], 0);
+      doc.setDrawColor(0, 0, 0);
+      doc.setLineWidth(0.55);
+      doc.line(2, y, 78, y);
+      doc.setLineDashPattern([], 0);
+    };
+
+    // ── OUTER BORDER drawn after content (placeholder — updated below) ──
+
+    // ── HEADER ──────────────────────────────────────────────
+    try {
+      const resp = await fetch('/logo_sbta02.JPG');
+      const blob = await resp.blob();
+      const dataUrl = await new Promise<string>((resolve) => {
+        const reader = new FileReader();
+        reader.onloadend = () => resolve(reader.result as string);
+        reader.readAsDataURL(blob);
+      });
+      doc.addImage(dataUrl, 'JPEG', 3, 3, 18, 16);
+    } catch {
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(7);
+      doc.setTextColor(0, 0, 0);
+      doc.text('S.B.T.A', 12, 9, { align: 'center' });
+      doc.setFont('helvetica', 'italic');
+      doc.setFontSize(5.5);
+      doc.text("L'Aventure continue", 12, 13, { align: 'center' });
+    }
+
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(20);
+    doc.setTextColor(0, 0, 0);
+    doc.text('SBTA', R, 11, { align: 'right' });
+    doc.setFontSize(5.5);
+    doc.setFont('helvetica', 'normal');
+    doc.text('Societe Bonkoungou Transport de L\'Agneby', R, 15, { align: 'right' });
+    doc.text('Tel 01 14 34 60 / 01 14 34 87', R, 18.5, { align: 'right' });
+
+    solid(21);
+
+    // ── DEPART row ───────────────────────────────────────────
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(12);
+    doc.text('DEPART', L, 29);
+    doc.setLineWidth(0.3);
+    doc.line(MID, 22, MID, 33);
+    doc.setFontSize(13);
+    doc.text(String(departureNum), (MID + R) / 2, 29, { align: 'center' });
+    dashed(33);
+
+    // ── ITINERARY row ────────────────────────────────────────
+    doc.setFontSize(10);
+    doc.setFont('helvetica', 'bold');
+    doc.text(origin, L, 41);
+    doc.setFontSize(9);
+    doc.text('=>', 38, 41, { align: 'center' });
+    doc.text(dest, R, 41, { align: 'right' });
+    dashed(45);
+
+    // ── SIEGE | TARIF row (même ligne, colonnes distinctes) ──
+    // Colonne gauche : SIEGE  L..52   Colonne droite : TARIF  53..R
+    const siegeRowY = 52;
+    const seatsX    = 16;       // après le label "SIEGE"
+    const colSplit  = 52;       // frontière gauche/droite
+    const seatsMaxW = colSplit - seatsX; // seats limités à la colonne gauche
+
+    // Label SIEGE (colonne gauche)
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(8);
+    doc.text('SIEGE', L, siegeRowY);
+    // Numéros de sièges (avec retour à la ligne dans la colonne gauche)
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(9);
+    doc.text(seatsDisplay, seatsX, siegeRowY, { maxWidth: seatsMaxW });
+
+    // Label TARIF (colonne droite, aligné à gauche de la zone droite)
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(8);
+    doc.text('TARIF', colSplit + 1, siegeRowY);
+    // Montant (aligné à droite)
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(10);
+    doc.text(tarif, R, siegeRowY, { align: 'right' });
+
+    // Hauteur dynamique : max entre les lignes de sièges et la ligne tarif (1 ligne)
+    const seatsLines = doc.splitTextToSize(seatsDisplay, seatsMaxW);
+    const lineH      = 4.5; // mm par ligne à fontSize 9
+    const rowH       = Math.max(seatsLines.length, 1) * lineH;
+    const afterSiegeY = siegeRowY + rowH - lineH + 5;
+    dashed(afterSiegeY);
+
+    // ── CAR | N°TICKET row (même ligne, colonnes fixes) ──────
+    // Colonne gauche : CAR  L..37   Colonne droite : N°TICKET  38..R
+    const carY       = afterSiegeY + 7;
+    const carColEnd  = 37; // frontière fixe entre les deux colonnes
+
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(8);
+    doc.text('CAR', L, carY);
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(8);
+    // busReg tronqué si trop long pour rester dans la colonne gauche
+    const busRegMaxW = carColEnd - 16;
+    const busRegLines = doc.splitTextToSize(busReg, busRegMaxW);
+    doc.text(busRegLines[0], 16, carY);
+
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(7);
+    doc.text('N\u00b0TICKET', carColEnd + 1, carY);
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(7);
+    doc.setTextColor(11, 116, 57);
+    // Référence tronquée si trop longue pour la colonne droite
+    const refMaxW   = R - (carColEnd + 1) - doc.getTextWidth('N\u00b0TICKET ');
+    const refLines  = doc.splitTextToSize(refFull, refMaxW);
+    doc.text(refLines[0], R, carY, { align: 'right' });
+    doc.setTextColor(0, 0, 0);
+    const afterTicketY = carY + 5;
+    dashed(afterTicketY);
+
+    // ── DATE / HEURE row ─────────────────────────────────────
+    const dateY = afterTicketY + 7;
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(8);
+    doc.text('DATE :', L, dateY);
+    doc.setFont('helvetica', 'bold');
+    doc.text(depDate, 17, dateY);
+    doc.setFont('helvetica', 'normal');
+    doc.text('HEURE:', 47, dateY);
+    doc.setFont('helvetica', 'bold');
+    doc.text(depTime, 62, dateY);
+    const afterDateY = dateY + 5;
+    dashed(afterDateY);
+
+    // ── NOTES ────────────────────────────────────────────────
+    const note1Y = afterDateY + 6;
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(6.5);
+    doc.text('NB. Tout ticket encaisse n est plus remboursable', 40, note1Y, { align: 'center' });
+    dashed(note1Y + 4);
+    const note2Y = note1Y + 9;
+    doc.text('SBTA pas responsable ces bagages sans ticket', 40, note2Y, { align: 'center' });
+    dashed(note2Y + 4);
+    const note3Y = note2Y + 9;
+    doc.setFontSize(6);
+    doc.text('VEUILLEZ CONSERVER LES TICKETS JUSQU\'A DESTINATION', 40, note3Y, { align: 'center' });
+    dashed(note3Y + 4);
+
+    // ── PRINT LINE ───────────────────────────────────────────
+    const printY = note3Y + 10;
+    doc.setFontSize(6.5);
+    doc.text('V10  Imprimer le :', L, printY);
+    doc.text(printDt, R, printY, { align: 'right' });
+
+    const solidY = printY + 6;
+    solid(solidY);
+
+    // ── OUTER BORDER (main ticket) — drawn with exact height ─
+    doc.setDrawColor(0, 0, 0);
+    doc.setLineWidth(0.4);
+    doc.rect(2, 2, W - 4, solidY - 2);
+
+    // ══════════════════════ SOUCHE ═══════════════════════════
+    const soucheStart = solidY + 5;
+    heavyDotted(soucheStart);
+
+    doc.setFont('helvetica', 'bolditalic');
+    doc.setFontSize(12);
+    doc.text('SOUCHE', 40, soucheStart + 8, { align: 'center' });
+
+    const soucheBodyStart = soucheStart + 13;
+    heavyDotted(soucheBodyStart);
+
+    // souche outer border drawn after content below
+
+    // DEPART souche
+    const sdepY = soucheBodyStart + 9;
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(11);
+    doc.text('DEPART', L, sdepY);
+    doc.setLineWidth(0.3);
+    doc.line(MID, soucheBodyStart + 1, MID, sdepY + 4);
+    doc.text(String(departureNum), (MID + R) / 2, sdepY, { align: 'center' });
+    dashed(sdepY + 4, L, R);
+
+    // itinerary souche
+    const sitiY = sdepY + 11;
+    doc.setFontSize(9);
+    doc.text(origin, L, sitiY);
+    doc.text('=>', 38, sitiY, { align: 'center' });
+    doc.text(dest, R, sitiY, { align: 'right' });
+    dashed(sitiY + 4, L, R);
+
+    // siege | tarif souche (même ligne, colonnes distinctes)
+    const ssiegeY = sitiY + 11;
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(8);
+    doc.text('SIEGE', L, ssiegeY);
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(9);
+    doc.text(seatsDisplay, seatsX, ssiegeY, { maxWidth: seatsMaxW });
+
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(8);
+    doc.text('TARIF', colSplit + 1, ssiegeY);
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(9);
+    doc.text(tarif, R, ssiegeY, { align: 'right' });
+
+    const ssLines  = doc.splitTextToSize(seatsDisplay, seatsMaxW);
+    const afterSsiegeY = ssiegeY + Math.max(ssLines.length, 1) * lineH - lineH + 5;
+    dashed(afterSsiegeY, L, R);
+
+    // car | N°TICKET souche (même ligne, colonnes fixes)
+    const scarY = afterSsiegeY + 7;
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(7.5);
+    doc.text('CAR', L, scarY);
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(7.5);
+    const sBusRegLines = doc.splitTextToSize(busReg, busRegMaxW);
+    doc.text(sBusRegLines[0], 16, scarY);
+
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(6.5);
+    doc.text('N\u00b0TICKET', carColEnd + 1, scarY);
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(6.5);
+    doc.setTextColor(11, 116, 57);
+    const sRefLines = doc.splitTextToSize(refFull, refMaxW);
+    doc.text(sRefLines[0], R, scarY, { align: 'right' });
+    doc.setTextColor(0, 0, 0);
+    const afterSticketY = scarY + 5;
+    dashed(afterSticketY, L, R);
+
+    // date/heure souche
+    const sdateY = afterSticketY + 7;
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(7.5);
+    doc.text('DATE :', L, sdateY);
+    doc.setFont('helvetica', 'bold');
+    doc.text(depDate, 17, sdateY);
+    doc.setFont('helvetica', 'normal');
+    doc.text('HEURE:', 47, sdateY);
+    doc.setFont('helvetica', 'bold');
+    doc.text(depTime, 62, sdateY);
+    dashed(sdateY + 4, L, R);
+
+    // print line souche
+    const sprintY = sdateY + 10;
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(6.5);
+    doc.text('V10  Imprimer le :', L, sprintY);
+    doc.text(printDt, R, sprintY, { align: 'right' });
+
+    // souche outer border drawn with exact height
+    doc.setLineWidth(0.4);
+    doc.setDrawColor(0, 0, 0);
+    doc.rect(2, soucheBodyStart, W - 4, sprintY + 4 - soucheBodyStart);
+
+    doc.autoPrint();
+    const blobUrl = doc.output('bloburl');
+    const printWin = window.open(blobUrl as unknown as string, '_blank');
+    if (printWin) {
+      printWin.addEventListener('afterprint', () => printWin.close());
+    }
+    toast.success('Impression du billet lancee');
+  };
+
+  const [baggageProcessing, setBaggageProcessing] = useState(false);
+
+  const handleSaveBaggage = async () => {
+    if (!baggageForm.owner_name.trim() || !baggageForm.owner_phone.trim() || !baggageForm.destination.trim()) {
+      toast.error('Remplissez au minimum : proprietaire, contact et destination');
+      return;
+    }
+    if (baggageForm.price <= 0) {
+      toast.error('Le prix du bagage doit etre superieur a 0');
+      return;
+    }
+
+    setBaggageProcessing(true);
+
+    try {
+      const baggageNumber = generateBaggageNumber();
+      let reservationId: string | null = null;
+      let departureNumber: number | null = baggageForm.departure_number ? parseInt(baggageForm.departure_number) : null;
+
+      if (baggageForm.mode === 'avec_ticket' && selectedSchedule) {
+        if (!baggageForm.seat_number.trim()) {
+          toast.error('Selectionnez un siege sur le plan avant d\'imprimer le ticket bagage avec ticket');
+          setBaggageProcessing(false);
+          return;
+        }
+
+        const seatNumbers = baggageForm.seat_number.split(',').map(s => s.trim()).filter(Boolean);
+
+        if (isOnline && hasSeatMap) {
+          for (const sn of seatNumbers) {
+            const available = await isSeatStillAvailable(selectedSchedule.id, sn);
+            if (!available) {
+              toast.error(`Le siege ${sn} vient d'etre reserve. Choisissez un autre siege.`);
+              await refresh();
+              setBaggageProcessing(false);
+              return;
+            }
+          }
+        }
+
+        const serverNow = getServerNow();
+        const reference = `SBTA-${serverNow.getFullYear()}-${Math.random().toString(36).substr(2, 8).toUpperCase()}`;
+
+        const { data: reservation, error: resError } = await supabase
+          .from('reservations')
+          .insert({
+            schedule_id: selectedSchedule.id,
+            passenger_name: baggageForm.owner_name.trim(),
+            passenger_phone: baggageForm.owner_phone.trim(),
+            seat_numbers: seatNumbers,
+            total_seats: seatNumbers.length,
+            total_price: baggageForm.price,
+            booking_reference: reference,
+            qr_code: reference,
+            status: 'confirmee',
+            payment_status: 'payee',
+            booked_by: user?.id,
+          })
+          .select('id')
+          .single();
+
+        if (resError) throw resError;
+        reservationId = reservation.id;
+
+        await supabase
+          .from('schedules')
+          .update({
+            seats_available: Math.max(0, selectedSchedule.seats_available - seatNumbers.length),
+            seats_reserved: (selectedSchedule.seats_reserved || 0) + seatNumbers.length,
+          })
+          .eq('id', selectedSchedule.id);
+
+        setSelectedSchedule(prev => prev ? {
+          ...prev,
+          seats_available: Math.max(0, prev.seats_available - seatNumbers.length),
+          seats_reserved: (prev.seats_reserved || 0) + seatNumbers.length,
+        } : prev);
+
+        try {
+          const { data: depSeq } = await supabase
+            .from('departure_sequence')
+            .select('departure_order, departure_number')
+            .eq('schedule_id', selectedSchedule.id)
+            .maybeSingle();
+          if (depSeq) {
+            departureNumber = depSeq.departure_order ?? depSeq.departure_number ?? null;
+          }
+        } catch (_) {}
+
+        if (hasSeatMap) {
+          for (const sn of seatNumbers) {
+            const seat = enrichedSelectedSeats.find(s => s.label === sn);
+            if (seat) toggleSeat(seat);
+          }
+          await refresh();
+        }
+      }
+
+      const modeLabel = baggageForm.mode === 'avec_ticket' ? 'Avec ticket'
+        : baggageForm.mode === 'avec_ticket_reporte' ? 'Avec ticket reporte'
+        : baggageForm.mode === 'sans_ticket' ? 'Sans siege'
+        : null;
+
+      const { error } = await supabase
+        .from('baggage_tickets')
+        .insert({
+          baggage_number: baggageNumber,
+          schedule_id: selectedSchedule?.id || null,
+          reservation_id: reservationId,
+          destination: baggageForm.destination.trim(),
+          price: baggageForm.price,
+          seat_number: baggageForm.mode === 'sans_ticket' ? null : (baggageForm.seat_number.trim() || null),
+          departure_number: departureNumber,
+          bus_registration: baggageForm.bus_registration.trim() || null,
+          description: baggageForm.description.trim() || null,
+          owner_name: baggageForm.owner_name.trim(),
+          owner_phone: baggageForm.owner_phone.trim(),
+          has_ticket: baggageForm.mode === 'avec_ticket' || baggageForm.mode === 'avec_ticket_reporte',
+          counter_id: myCounterId,
+          station_id: myStationId,
+          sold_by: user!.id,
+        });
+
+      if (error) throw error;
+
+      const ticketData: BaggageTicketData = {
+        baggage_number: baggageNumber,
+        destination: baggageForm.destination,
+        price: baggageForm.price,
+        seat_number: baggageForm.mode === 'sans_ticket' ? null : (baggageForm.seat_number || null),
+        departure_number: departureNumber,
+        bus_registration: baggageForm.bus_registration || null,
+        description: baggageForm.description || null,
+        owner_name: baggageForm.owner_name,
+        owner_phone: baggageForm.owner_phone,
+        station_name: myStationName || 'SBTA',
+        mode_label: modeLabel,
+      };
+
+      printBaggageTicket(ticketData);
+      toast.success('Ticket bagage imprime');
+
+      setBaggageForm({
+        has_ticket: false, destination: '', price: 0, seat_number: '',
+        departure_number: '', bus_registration: '', description: '',
+        owner_name: '', owner_phone: '',
+      });
+      setShowBaggage(false);
+    } catch (err: any) {
+      console.error('Erreur sauvegarde bagage:', err);
+      toast.error(err.message || 'Erreur lors de la sauvegarde du bagage');
+    } finally {
+      setBaggageProcessing(false);
+    }
+  };
+
+  const switchBaggageMode = (mode: BaggageMode) => {
+    if (mode === 'none') {
+      setBaggageForm(prev => ({
+        ...prev,
+        mode: 'none',
+        has_ticket: false,
+        destination: '',
+        seat_number: '',
+        bus_registration: '',
+        departure_number: '',
+      }));
+      return;
+    }
+
+    const autoFillSchedule = (mode === 'avec_ticket' || mode === 'avec_ticket_reporte' || mode === 'sans_ticket') && selectedSchedule;
+
+    if (autoFillSchedule && selectedSchedule.id) {
+      supabase
+        .from('departure_sequence')
+        .select('departure_order, departure_number')
+        .eq('schedule_id', selectedSchedule.id)
+        .maybeSingle()
+        .then(({ data }) => {
+          if (data) {
+            const num = data.departure_order ?? data.departure_number;
+            if (num) setBaggageForm(prev => ({ ...prev, departure_number: String(num) }));
+          }
+        });
+    }
+
+    const seatLabels = (mode === 'avec_ticket' || mode === 'avec_ticket_reporte') && hasSeatMap
+      ? enrichedSelectedSeats.map(s => s.label).join(', ')
+      : '';
+
+    setBaggageForm(prev => ({
+      ...prev,
+      mode,
+      has_ticket: mode === 'avec_ticket' || mode === 'avec_ticket_reporte',
+      destination: autoFillSchedule ? (selectedSchedule.destination_city_name || prev.destination) : prev.destination,
+      bus_registration: autoFillSchedule ? (selectedSchedule.buses?.registration_number || prev.bus_registration) : prev.bus_registration,
+      seat_number: mode === 'sans_ticket' ? '' : (seatLabels || prev.seat_number),
+      owner_name: (mode === 'avec_ticket' || mode === 'avec_ticket_reporte') ? (passenger.name || prev.owner_name) : prev.owner_name,
+      owner_phone: (mode === 'avec_ticket' || mode === 'avec_ticket_reporte') ? (passenger.phone || prev.owner_phone) : prev.owner_phone,
+    }));
+  };
+
+  const resetSale = () => {
+    setStep('search');
+    setSelectedSchedule(null);
+    setSchedules([]);
+    clearSeatSelection();
+    setSeatCount(1);
+    setPassenger({ name: '', phone: '', id_number: '' });
+    setPayment({ method: '', amount_received: 0, reference: '', mobile_provider: '' });
+    setConfirmedTicket(null);
+    setBoardingStationId('');
+    setAlightingStationId('');
+    setBoardingStations([]);
+    setAlightingStations([]);
+    setShowBaggage(false);
+    setBaggageForm({
+      mode: 'none', has_ticket: false, destination: '', price: 0, seat_number: '',
+      departure_number: '', bus_registration: '', description: '',
+      owner_name: '', owner_phone: '',
+    });
+  };
+
+  useEffect(() => {
+    if ((baggageForm.mode === 'avec_ticket' || baggageForm.mode === 'avec_ticket_reporte') && selectedSchedule) {
+      const seatLabels = hasSeatMap ? enrichedSelectedSeats.map(s => s.label).join(', ') : '';
+      setBaggageForm(prev => ({
+        ...prev,
+        seat_number: seatLabels,
+        owner_name: passenger.name || prev.owner_name,
+        owner_phone: passenger.phone || prev.owner_phone,
+      }));
+    }
+  }, [enrichedSelectedSeats.length, passenger.name, passenger.phone]);
+
+  const stepIndex = STEPS.findIndex(s => s.id === step);
+  const originCity = cities.find(c => c.id === search.origin_city_id);
+  const destCity = cities.find(c => c.id === search.destination_city_id);
+
+  const getDuration = (dep: string, arr: string, minutes: number | null): string => {
+    if (minutes) {
+      const h = Math.floor(minutes / 60);
+      const m = minutes % 60;
+      return h > 0 ? `${h}h${m > 0 ? m + 'min' : ''}` : `${m}min`;
+    }
+    const diff = new Date(arr).getTime() - new Date(dep).getTime();
+    const h = Math.floor(diff / 3600000);
+    const m = Math.floor((diff % 3600000) / 60000);
+    return h > 0 ? `${h}h${m > 0 ? m + 'min' : ''}` : `${m}min`;
+  };
+
+  return (
+    <div className={`${step === 'seats' ? 'max-w-7xl' : 'max-w-5xl'} mx-auto p-6 space-y-4`}>
+      <div className="flex items-start justify-between flex-wrap gap-3">
+        <div>
+          <h1 className="text-2xl font-bold" style={{ color: 'var(--text-primary)' }}>Vente de billet</h1>
+          <p className="text-sm mt-1" style={{ color: 'var(--text-secondary)' }}>Procédure de vente au guichet</p>
+        </div>
+        <div className="flex items-center gap-2">
+          {!isOnline && (
+            <span className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold"
+                  style={{ backgroundColor: '#FEF3C7', color: '#D97706' }}>
+              <WifiOff className="w-3.5 h-3.5" />
+              Hors-ligne
+            </span>
+          )}
+          <button
+            onClick={() => setShowQueue(true)}
+            className="relative flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-sm font-semibold transition-all hover:shadow-sm"
+            style={{ borderColor: pendingCount > 0 ? '#F59E0B' : 'var(--border)', color: 'var(--text-secondary)' }}
+          >
+            <List className="w-4 h-4" />
+            File hors-ligne
+            {pendingCount > 0 && (
+              <span className="absolute -top-1.5 -right-1.5 w-5 h-5 flex items-center justify-center rounded-full text-xs font-black text-white"
+                    style={{ backgroundColor: '#DC2626' }}>
+                {pendingCount > 9 ? '9+' : pendingCount}
+              </span>
+            )}
+          </button>
+        </div>
+      </div>
+
+      <OfflineBanner
+        isOnline={isOnline}
+        wasOffline={wasOffline}
+        pendingCount={pendingCount}
+        syncing={syncing}
+        onSyncNow={syncNow}
+        onShowQueue={() => setShowQueue(true)}
+      />
+
+      {driftWarning && (
+        <div className="rounded-xl p-4 border flex items-start gap-3"
+             style={{ backgroundColor: '#FEF2F2', borderColor: '#FECACA' }}>
+          <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5" style={{ color: '#DC2626' }} />
+          <div>
+            <p className="text-sm font-bold" style={{ color: '#DC2626' }}>
+              Decalage d'horloge detecte
+            </p>
+            <p className="text-xs mt-0.5" style={{ color: '#991B1B' }}>
+              L'heure de votre ordinateur ne correspond pas a l'heure du serveur. Les ventes utilisent uniquement l'heure officielle du serveur pour prevenir la fraude.
+            </p>
+          </div>
+        </div>
+      )}
+
+      <div className="rounded-xl p-1 flex gap-1" style={{ backgroundColor: 'var(--surface-raised)' }}>
+        {STEPS.map((s, i) => (
+          <div
+            key={s.id}
+            className="flex-1 flex items-center justify-center py-2 rounded-lg text-xs font-semibold transition-all"
+            style={{
+              backgroundColor: i <= stepIndex ? 'var(--primary)' : 'transparent',
+              color: i <= stepIndex ? 'white' : 'var(--text-muted)',
+            }}
+          >
+            <span className="mr-1.5 w-4 h-4 rounded-full text-xs flex items-center justify-center"
+              style={{ backgroundColor: i <= stepIndex ? 'rgba(255,255,255,0.25)' : 'var(--border)' }}>
+              {i + 1}
+            </span>
+            <span className="hidden sm:inline">{s.label}</span>
+          </div>
+        ))}
+      </div>
+
+      {step === 'search' && (
+        <div className="rounded-xl p-6 border" style={{ backgroundColor: 'var(--surface)' }}>
+          <div className="flex items-center justify-between mb-5">
+            <h2 className="text-lg font-bold" style={{ color: 'var(--text-primary)' }}>
+              Rechercher un voyage disponible
+            </h2>
+            {!isOnline && (
+              <span className="flex items-center gap-1.5 text-xs font-medium px-3 py-1 rounded-full"
+                    style={{ backgroundColor: '#FEF3C7', color: '#D97706' }}>
+                <WifiOff className="w-3 h-3" />
+                Voyages depuis le cache local
+              </span>
+            )}
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+            <div>
+              <label className="block text-sm font-medium mb-1.5" style={{ color: 'var(--text-secondary)' }}>
+                Ville de départ *
+              </label>
+              {myCityId ? (
+                <div
+                  className="w-full px-3 py-2.5 rounded-lg border text-sm font-semibold flex items-center gap-2"
+                  style={{ borderColor: 'var(--primary)', backgroundColor: 'var(--primary-light)', color: 'var(--primary)' }}
+                >
+                  <MapPin className="w-4 h-4 flex-shrink-0" />
+                  {cities.find(c => c.id === myCityId)?.name || myStationName || '...'}
+                </div>
+              ) : (
+                <select
+                  value={search.origin_city_id}
+                  onChange={e => setSearch({ ...search, origin_city_id: e.target.value })}
+                  className="w-full px-3 py-2.5 rounded-lg border text-sm"
+                  style={{ borderColor: 'var(--border)' }}
+                >
+                  <option value="">Sélectionner...</option>
+                  {cities.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                </select>
+              )}
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1.5" style={{ color: 'var(--text-secondary)' }}>
+                Ville d'arrivée *
+              </label>
+              <select
+                value={search.destination_city_id}
+                onChange={e => setSearch({ ...search, destination_city_id: e.target.value })}
+                className="w-full px-3 py-2.5 rounded-lg border text-sm"
+                style={{ borderColor: 'var(--border)' }}
+              >
+                <option value="">Sélectionner...</option>
+                {cities
+                  .filter(c => c.id !== search.origin_city_id)
+                  .filter(c => !assignedDestCityIds || assignedDestCityIds.includes(c.id))
+                  .map(c => (
+                    <option key={c.id} value={c.id}>{c.name}</option>
+                  ))}
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1.5" style={{ color: 'var(--text-secondary)' }}>
+                Date de départ *
+              </label>
+              <input
+                type="date"
+                value={search.date}
+                onChange={e => setSearch({ ...search, date: e.target.value })}
+                className="w-full px-3 py-2.5 rounded-lg border text-sm"
+                style={{ borderColor: 'var(--border)' }}
+                min={format(getServerNow(), 'yyyy-MM-dd')}
+              />
+            </div>
+          </div>
+          <button
+            onClick={handleSearch}
+            disabled={loadingSchedules}
+            className="w-full py-3 rounded-lg font-semibold text-white flex items-center justify-center gap-2 disabled:opacity-60"
+            style={{ backgroundColor: 'var(--primary)' }}
+          >
+            {loadingSchedules ? (
+              <><div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />Recherche en cours...</>
+            ) : (
+              <><Search className="w-5 h-5" />{isOnline ? 'Rechercher les voyages disponibles' : 'Rechercher dans le cache local'}</>
+            )}
+          </button>
+        </div>
+      )}
+
+      {step === 'select' && (
+        <div className="space-y-4">
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <div>
+              <h2 className="text-lg font-bold" style={{ color: 'var(--text-primary)' }}>
+                {schedules.length} voyage{schedules.length !== 1 ? 's' : ''} disponible{schedules.length !== 1 ? 's' : ''}
+                {!isOnline && (
+                  <span className="ml-2 text-xs font-normal px-2 py-0.5 rounded-full"
+                        style={{ backgroundColor: '#FEF3C7', color: '#D97706' }}>
+                    cache local
+                  </span>
+                )}
+              </h2>
+              <p className="text-sm flex items-center gap-1.5 mt-0.5" style={{ color: 'var(--text-secondary)' }}>
+                <MapPin className="w-3.5 h-3.5" style={{ color: 'var(--primary)' }} />
+                <strong>{originCity?.name}</strong>
+                <ChevronRight className="w-3.5 h-3.5" />
+                <strong>{destCity?.name}</strong>
+                <span className="mx-1">·</span>
+                <Calendar className="w-3.5 h-3.5" />
+                {format(new Date(search.date + 'T12:00:00'), 'dd MMMM yyyy', { locale: fr })}
+              </p>
+            </div>
+            <button
+              onClick={() => setStep('search')}
+              className="flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-lg border"
+              style={{ color: 'var(--text-secondary)', borderColor: 'var(--border)' }}
+            >
+              <ArrowLeft className="w-4 h-4" />
+              Modifier la recherche
+            </button>
+          </div>
+
+          {schedules.length === 0 ? (
+            <div className="rounded-xl p-12 text-center border" style={{ backgroundColor: 'var(--surface)' }}>
+              <AlertCircle className="w-12 h-12 mx-auto mb-3" style={{ color: 'var(--text-muted)' }} />
+              <p className="font-medium" style={{ color: 'var(--text-primary)' }}>Aucun voyage disponible</p>
+              <p className="text-sm mt-1" style={{ color: 'var(--text-secondary)' }}>
+                {!isOnline
+                  ? 'Aucun voyage en cache. Connectez-vous pour actualiser les données.'
+                  : `Aucun départ planifié sur l'itinéraire ${originCity?.name} → ${destCity?.name} le ${format(new Date(search.date + 'T12:00:00'), 'dd/MM/yyyy')}`
+                }
+              </p>
+              <button onClick={() => setStep('search')} className="mt-4 px-4 py-2 rounded-lg text-sm font-medium border">
+                Nouvelle recherche
+              </button>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {schedules.map(schedule => {
+                const depTime = format(new Date(schedule.departure_datetime), 'HH:mm');
+                const arrTime = format(new Date(schedule.arrival_datetime), 'HH:mm');
+                const duration = getDuration(schedule.departure_datetime, schedule.arrival_datetime, schedule.estimated_duration_minutes);
+                const isFull = schedule.seats_available === 0;
+                const isDeparted = new Date(schedule.departure_datetime) <= now;
+                const isDisabled = isFull || isDeparted;
+                const fillPct = schedule.buses?.total_seats
+                  ? Math.round(((schedule.seats_reserved || 0) / schedule.buses.total_seats) * 100)
+                  : 0;
+
+                return (
+                  <div
+                    key={schedule.id}
+                    className="rounded-xl border transition-all"
+                    style={{
+                      backgroundColor: isDeparted ? '#FEF2F2' : 'var(--surface)',
+                      opacity: isDisabled ? 0.72 : 1,
+                      borderColor: isDeparted ? '#FECACA' : 'var(--border)',
+                      boxShadow: isDeparted ? 'none' : undefined,
+                    }}
+                  >
+                    <div className="p-5">
+                      <div className="flex items-start justify-between gap-4">
+                        <div className="flex-1">
+                          <div className="flex items-center gap-3 mb-3">
+                            <div className="text-center min-w-[56px]">
+                              <p className="text-2xl font-black leading-none" style={{ color: 'var(--text-primary)' }}>{depTime}</p>
+                              <p className="text-xs mt-0.5 font-medium" style={{ color: 'var(--primary)' }}>
+                                {schedule.origin_city_name}
+                              </p>
+                            </div>
+                            <div className="flex-1 flex flex-col items-center gap-1">
+                              <div className="w-full flex items-center gap-2">
+                                <div className="h-px flex-1" style={{ backgroundColor: 'var(--border)' }} />
+                                <div className="flex flex-col items-center">
+                                  <Bus className="w-4 h-4" style={{ color: 'var(--text-muted)' }} />
+                                  <span className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>{duration}</span>
+                                </div>
+                                <div className="h-px flex-1" style={{ backgroundColor: 'var(--border)' }} />
+                              </div>
+                              <p className="text-xs text-center font-medium" style={{ color: 'var(--text-secondary)' }}>
+                                {schedule.route?.name || schedule.route_name}
+                              </p>
+                            </div>
+                            <div className="text-center min-w-[56px]">
+                              <p className="text-2xl font-black leading-none" style={{ color: 'var(--text-primary)' }}>{arrTime}</p>
+                              <p className="text-xs mt-0.5 font-medium" style={{ color: 'var(--primary)' }}>
+                                {schedule.destination_city_name}
+                              </p>
+                            </div>
+                          </div>
+
+                          <div className="flex items-center gap-3 flex-wrap text-xs" style={{ color: 'var(--text-muted)' }}>
+                            <span className="flex items-center gap-1">
+                              <Bus className="w-3.5 h-3.5" />
+                              {schedule.buses?.registration_number}
+                              {schedule.buses?.brand && ` · ${schedule.buses.brand}`}
+                            </span>
+                            <span className="flex items-center gap-1">
+                              <Users className="w-3.5 h-3.5" />
+                              <span style={{ color: isDeparted ? '#B91C1C' : isFull ? 'var(--danger)' : schedule.seats_available <= 5 ? 'var(--warning)' : 'var(--success)' }}>
+                                {isDeparted ? 'Embarquement' : isFull ? 'Complet' : `${schedule.seats_available} place${schedule.seats_available > 1 ? 's' : ''} dispo`}
+                              </span>
+                              {!isDeparted && <span style={{ color: 'var(--text-muted)' }}>/ {schedule.buses?.total_seats}</span>}
+                            </span>
+                            {isDeparted && (
+                              <span className="flex items-center gap-1 px-2 py-0.5 rounded-full font-bold"
+                                style={{ backgroundColor: '#FEE2E2', color: '#B91C1C' }}>
+                                <Clock className="w-3 h-3" />
+                                Embarquement — vente clôturée
+                              </span>
+                            )}
+                            {!isDeparted && (
+                              <span className="px-2 py-0.5 rounded-full font-semibold"
+                                style={{ backgroundColor: 'var(--primary-light)', color: 'var(--primary)' }}>
+                                {BUS_CLASS_LABELS[schedule.buses?.class] || 'Standard'}
+                              </span>
+                            )}
+                            {schedule.buses?.seat_config_id && (
+                              <span className="flex items-center gap-1">
+                                <LayoutGrid className="w-3.5 h-3.5" />
+                                Plan disponible
+                              </span>
+                            )}
+                            {schedule.route?.distance_km && (
+                              <span className="flex items-center gap-1">
+                                <Tag className="w-3.5 h-3.5" />
+                                {schedule.route.distance_km} km
+                              </span>
+                            )}
+                          </div>
+
+                          <div className="mt-3 h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: 'var(--border)' }}>
+                            <div
+                              className="h-full rounded-full transition-all"
+                              style={{
+                                width: `${fillPct}%`,
+                                backgroundColor: fillPct >= 90 ? 'var(--danger)' : fillPct >= 70 ? 'var(--warning)' : 'var(--success)',
+                              }}
+                            />
+                          </div>
+                        </div>
+
+                        <div className="text-right flex flex-col items-end gap-3 flex-shrink-0">
+                          <div>
+                            <p className="text-2xl font-black leading-none" style={{ color: 'var(--primary)' }}>
+                              {formatCurrency(schedule.price)}
+                            </p>
+                            <p className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>par place</p>
+                          </div>
+                          <button
+                            onClick={() => handleSelectSchedule(schedule)}
+                            disabled={isDisabled}
+                            className="px-5 py-2.5 rounded-lg text-sm font-bold text-white transition-all disabled:cursor-not-allowed"
+                            style={{
+                              backgroundColor: isDeparted ? '#DC2626' : isFull ? 'var(--text-muted)' : 'var(--primary)',
+                              opacity: isDisabled ? 0.7 : 1,
+                            }}
+                          >
+                            {isDeparted ? 'Embarquement' : isFull ? 'Complet' : 'Choisir'}
+                          </button>
+                        </div>
+                      </div>
+
+                      {schedule.notes && (
+                        <div className="mt-3 px-3 py-2 rounded-lg text-xs"
+                          style={{ backgroundColor: 'var(--warning-light)', color: 'var(--warning)' }}>
+                          {schedule.notes}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {step === 'seats' && selectedSchedule && (
+        <div className="space-y-3">
+          {/* Header */}
+          <div className="flex items-center gap-3">
+            <button onClick={() => setStep('select')} style={{ color: 'var(--text-muted)' }}>
+              <ArrowLeft className="w-5 h-5" />
+            </button>
+            <div>
+              <h2 className="text-lg font-bold" style={{ color: 'var(--text-primary)' }}>Vente de billet</h2>
+              <p className="text-sm flex items-center gap-1.5 mt-0.5 flex-wrap" style={{ color: 'var(--text-secondary)' }}>
+                <span className="font-semibold">{selectedSchedule.origin_city_name}</span>
+                <ChevronRight className="w-3 h-3" />
+                <span className="font-semibold">{selectedSchedule.destination_city_name}</span>
+                <span className="opacity-40">·</span>
+                <Clock className="w-3.5 h-3.5" />
+                {format(new Date(selectedSchedule.departure_datetime), 'dd/MM/yyyy HH:mm')}
+                <span className="opacity-40">·</span>
+                <span className="font-bold" style={{ color: 'var(--primary)' }}>
+                  {formatCurrency(selectedSchedule.price)}/place
+                </span>
+              </p>
+            </div>
+          </div>
+
+          {!isOnline && (
+            <div className="flex items-center gap-2 px-3 py-2 rounded-lg text-xs"
+                 style={{ backgroundColor: '#FEF3C7', color: '#D97706' }}>
+              <WifiOff className="w-3.5 h-3.5 flex-shrink-0" />
+              <span>Hors-ligne : le plan de sièges n'est pas disponible. Sélection manuelle.</span>
+            </div>
+          )}
+
+          {/* Two-column layout: seat map left, sale panel right */}
+          <div className="grid grid-cols-1 xl:grid-cols-[1fr_380px] gap-5 items-start">
+
+            {/* LEFT — Seat map */}
+            <div className="rounded-2xl border overflow-hidden" style={{ backgroundColor: 'var(--surface)' }}>
+              {seatMapError ? (
+                <div className="p-6">
+                  <p className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
+                    {seatMapError}
+                  </p>
+                </div>
+              ) : seatMapLoading ? (
+                <div className="flex flex-col items-center justify-center py-20 gap-3">
+                  <div className="w-8 h-8 rounded-full animate-spin" style={{ borderWidth: 3, borderStyle: 'solid', borderColor: 'var(--primary)', borderTopColor: 'transparent' }} />
+                  <span className="text-sm" style={{ color: 'var(--text-muted)' }}>Chargement du plan de sièges...</span>
+                </div>
+              ) : seatMap ? (
+                <BusSeatMapPanel
+                  seatMap={seatMap}
+                  selectedSeats={enrichedSelectedSeats}
+                  onSeatToggle={toggleSeat}
+                  onConfirm={handleSeatsConfirm}
+                  showPassengerNames={true}
+                  lockCountdowns={lockCountdowns}
+                />
+              ) : (
+                <div className="p-6">
+                  <p className="text-xs font-medium mb-3" style={{ color: 'var(--text-muted)' }}>Nombre de places à réserver *</p>
+                  <div className="flex items-center gap-3 mb-5">
+                    <button
+                      onClick={() => setSeatCount(c => Math.max(1, c - 1))}
+                      className="w-10 h-10 rounded-lg border-2 flex items-center justify-center transition-all hover:bg-slate-50"
+                      style={{ borderColor: 'var(--border)', color: 'var(--text-secondary)' }}
+                      type="button"
+                    >—</button>
+                    <span className="text-3xl font-black w-12 text-center" style={{ color: 'var(--primary)' }}>
+                      {seatCount}
+                    </span>
+                    <button
+                      onClick={() => setSeatCount(c => Math.min(selectedSchedule.seats_available, c + 1))}
+                      className="w-10 h-10 rounded-lg border-2 flex items-center justify-center transition-all hover:bg-slate-50"
+                      style={{ borderColor: 'var(--border)', color: 'var(--text-secondary)' }}
+                      type="button"
+                    >+</button>
+                    <span className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                      / {selectedSchedule.seats_available} disponibles
+                    </span>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* RIGHT — Sale panel */}
+            <div className="space-y-3">
+
+              {/* Trip summary — compact card */}
+              <div className="rounded-2xl border p-4 space-y-2.5" style={{ backgroundColor: 'var(--surface)' }}>
+                <h3 className="text-xs font-bold uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>Récapitulatif du voyage</h3>
+                <div className="space-y-1.5 text-sm">
+                  <div className="flex justify-between items-center">
+                    <span style={{ color: 'var(--text-secondary)' }}>Trajet</span>
+                    <span className="font-bold flex items-center gap-1">
+                      {selectedSchedule.origin_city_name}
+                      <ChevronRight className="w-3.5 h-3.5" style={{ color: 'var(--text-muted)' }} />
+                      {selectedSchedule.destination_city_name}
+                    </span>
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span style={{ color: 'var(--text-secondary)' }}>Départ</span>
+                    <span className="font-semibold">{format(new Date(selectedSchedule.departure_datetime), 'dd/MM/yyyy HH:mm')}</span>
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span style={{ color: 'var(--text-secondary)' }}>Bus</span>
+                    <span className="font-semibold">{selectedSchedule.buses?.registration_number || '—'}</span>
+                  </div>
+
+                  {boardingStations.length > 0 && (
+                    <div className="pt-1">
+                      <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>
+                        <LogIn className="w-3 h-3 inline mr-1" />Gare d'embarquement
+                      </label>
+                      <div
+                        className="w-full px-2.5 py-1.5 rounded-lg border text-sm font-semibold"
+                        style={{ borderColor: 'var(--primary)', backgroundColor: 'var(--primary-light)', color: 'var(--primary)' }}
+                      >
+                        {boardingStations.find(s => s.id === boardingStationId)?.name || '—'}
+                      </div>
+                    </div>
+                  )}
+
+                  {alightingStations.length > 0 && (
+                    <div>
+                      <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>
+                        <LogOut className="w-3 h-3 inline mr-1" />Gare de débarquement
+                      </label>
+                      <select
+                        value={alightingStationId}
+                        onChange={e => setAlightingStationId(e.target.value)}
+                        className="w-full px-2.5 py-1.5 rounded-lg border text-sm"
+                        style={{ borderColor: 'var(--border)' }}
+                      >
+                        <option value="">— Sélectionner —</option>
+                        {alightingStations.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                      </select>
+                    </div>
+                  )}
+
+                  <div className="pt-1.5 border-t" style={{ borderColor: 'var(--border)' }}>
+                    <div className="flex justify-between items-start">
+                      <span style={{ color: 'var(--text-secondary)' }}>Sièges</span>
+                      <div className="text-right">
+                        {hasSeatMap ? (
+                          enrichedSelectedSeats.length === 0
+                            ? <span className="text-xs italic" style={{ color: 'var(--text-muted)' }}>Aucun siège sélectionné</span>
+                            : <span className="font-bold font-mono text-sm" style={{ color: 'var(--primary)' }}>
+                                {enrichedSelectedSeats.map(s => s.label).join(', ')}
+                              </span>
+                        ) : (
+                          <span className="font-bold" style={{ color: 'var(--primary)' }}>
+                            {seatCount} place{seatCount > 1 ? 's' : ''}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="flex justify-between items-center">
+                    <span style={{ color: 'var(--text-secondary)' }}>Prix unitaire</span>
+                    <span className="font-semibold">{formatCurrency(selectedSchedule.price)}</span>
+                  </div>
+                  <div className="flex justify-between items-center rounded-lg px-3 py-2"
+                       style={{ backgroundColor: 'var(--primary-light)' }}>
+                    <span className="font-bold text-sm" style={{ color: 'var(--primary)' }}>Total à payer</span>
+                    <span className="text-xl font-black" style={{ color: 'var(--primary)' }}>
+                      {formatCurrency(totalAmount)}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Baggage section — right after trip summary */}
+              <div className="rounded-2xl border overflow-hidden" style={{ backgroundColor: 'var(--surface)' }}>
+                <button
+                  type="button"
+                  onClick={() => setShowBaggage(!showBaggage)}
+                  className="w-full px-4 py-3 flex items-center justify-between hover:bg-gray-50 transition-colors"
+                >
+                  <div className="flex items-center gap-2">
+                    <Luggage className="w-4.5 h-4.5" style={{ color: 'var(--primary)' }} />
+                    <span className="text-sm font-bold" style={{ color: 'var(--text-primary)' }}>Bagage</span>
+                  </div>
+                  {showBaggage
+                    ? <ChevronUp className="w-4 h-4" style={{ color: 'var(--text-muted)' }} />
+                    : <ChevronDown className="w-4 h-4" style={{ color: 'var(--text-muted)' }} />
+                  }
+                </button>
+
+                {showBaggage && (
+                  <div className="px-4 pb-4 space-y-3 border-t" style={{ borderColor: 'var(--border)' }}>
+                    {/* Mode selection — exclusive checkboxes */}
+                    <div className="pt-3 flex items-center gap-5 flex-wrap">
+                      {([
+                        { value: 'avec_ticket' as BaggageMode, label: 'Avec ticket' },
+                        { value: 'avec_ticket_reporte' as BaggageMode, label: 'Avec ticket reporte' },
+                        { value: 'sans_ticket' as BaggageMode, label: 'Sans siege' },
+                      ]).map(opt => (
+                        <label key={opt.value} className="flex items-center gap-2 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={baggageForm.mode === opt.value}
+                            onChange={() => switchBaggageMode(baggageForm.mode === opt.value ? 'none' : opt.value)}
+                            className="w-4 h-4 rounded"
+                          />
+                          <span className="text-xs font-semibold" style={{ color: 'var(--text-secondary)' }}>{opt.label}</span>
+                        </label>
+                      ))}
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2.5">
+                      <div>
+                        <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>Destination *</label>
+                        <input
+                          type="text"
+                          value={baggageForm.destination}
+                          onChange={e => setBaggageForm({ ...baggageForm, destination: e.target.value.toUpperCase() })}
+                          className="w-full px-2.5 py-2 rounded-lg border text-sm"
+                          style={{ borderColor: 'var(--border)', backgroundColor: baggageForm.mode !== 'none' ? 'var(--neutral-50)' : 'white' }}
+                          readOnly={baggageForm.mode !== 'none'}
+                          placeholder="Ex: BOUAKE"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>Prix (FCFA) *</label>
+                        <input
+                          type="number"
+                          value={baggageForm.price || ''}
+                          onChange={e => setBaggageForm({ ...baggageForm, price: parseInt(e.target.value) || 0 })}
+                          className="w-full px-2.5 py-2 rounded-lg border text-sm"
+                          style={{ borderColor: 'var(--border)' }}
+                          placeholder="0"
+                        />
+                      </div>
+                    </div>
+
+                    {baggageForm.mode === 'sans_ticket' ? (
+                      <div>
+                        <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>N depart</label>
+                        <input
+                          type="text"
+                          value={baggageForm.departure_number}
+                          readOnly
+                          className="w-full px-2.5 py-2 rounded-lg border text-sm"
+                          style={{ borderColor: 'var(--border)', backgroundColor: 'var(--neutral-50)' }}
+                          placeholder="--"
+                        />
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-2 gap-2.5">
+                        <div>
+                          <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>Siege</label>
+                          <input
+                            type="text"
+                            value={baggageForm.seat_number}
+                            onChange={e => setBaggageForm({ ...baggageForm, seat_number: e.target.value })}
+                            className="w-full px-2.5 py-2 rounded-lg border text-sm"
+                            style={{ borderColor: 'var(--border)', backgroundColor: (baggageForm.mode === 'avec_ticket' || baggageForm.mode === 'avec_ticket_reporte') ? 'var(--neutral-50)' : 'white' }}
+                            readOnly={baggageForm.mode === 'avec_ticket' || baggageForm.mode === 'avec_ticket_reporte'}
+                            placeholder="--"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>N depart</label>
+                          <input
+                            type="text"
+                            value={baggageForm.departure_number}
+                            onChange={e => setBaggageForm({ ...baggageForm, departure_number: e.target.value })}
+                            className="w-full px-2.5 py-2 rounded-lg border text-sm"
+                            style={{ borderColor: 'var(--border)' }}
+                            placeholder="--"
+                          />
+                        </div>
+                      </div>
+                    )}
+
+                    <div>
+                      <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>Car (immatriculation)</label>
+                      <input
+                        type="text"
+                        value={baggageForm.bus_registration}
+                        onChange={e => setBaggageForm({ ...baggageForm, bus_registration: e.target.value.toUpperCase() })}
+                        className="w-full px-2.5 py-2 rounded-lg border text-sm"
+                        style={{ borderColor: 'var(--border)', backgroundColor: baggageForm.mode !== 'none' ? 'var(--neutral-50)' : 'white' }}
+                        readOnly={baggageForm.mode !== 'none'}
+                        placeholder="Ex: AA 830 HV 01"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>Description du bagage</label>
+                      <input
+                        type="text"
+                        value={baggageForm.description}
+                        onChange={e => setBaggageForm({ ...baggageForm, description: e.target.value })}
+                        className="w-full px-2.5 py-2 rounded-lg border text-sm"
+                        style={{ borderColor: 'var(--border)' }}
+                        placeholder="Ex: Valise noire, carton..."
+                      />
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2.5">
+                      <div>
+                        <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>Proprietaire *</label>
+                        <input
+                          type="text"
+                          value={baggageForm.owner_name}
+                          onChange={e => setBaggageForm({ ...baggageForm, owner_name: e.target.value.toUpperCase() })}
+                          className="w-full px-2.5 py-2 rounded-lg border text-sm"
+                          style={{ borderColor: 'var(--border)' }}
+                          placeholder="Nom et prenoms"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>Contact *</label>
+                        <input
+                          type="text"
+                          value={baggageForm.owner_phone}
+                          onChange={e => setBaggageForm({ ...baggageForm, owner_phone: e.target.value })}
+                          className="w-full px-2.5 py-2 rounded-lg border text-sm"
+                          style={{ borderColor: 'var(--border)' }}
+                          placeholder="07 XX XX XX XX"
+                        />
+                      </div>
+                    </div>
+
+                    {baggageForm.mode === 'avec_ticket' && !baggageForm.seat_number.trim() && (
+                      <div className="rounded-lg px-3 py-2 text-xs flex items-center gap-2"
+                        style={{ backgroundColor: 'var(--warning-light)', color: 'var(--warning)' }}>
+                        <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />
+                        Selectionnez un siege sur le plan pour vendre un ticket bagage avec ticket
+                      </div>
+                    )}
+
+                    <button
+                      type="button"
+                      onClick={handleSaveBaggage}
+                      disabled={baggageProcessing || (baggageForm.mode === 'avec_ticket' && !baggageForm.seat_number.trim())}
+                      className="w-full py-2.5 rounded-xl font-bold text-sm text-white flex items-center justify-center gap-2 transition-all hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed"
+                      style={{ backgroundColor: 'var(--primary)' }}
+                    >
+                      {baggageProcessing ? (
+                        <><div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />Traitement...</>
+                      ) : (
+                        <><Printer className="w-4 h-4" />Imprimer ticket bagage</>
+                      )}
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {/* Passenger info */}
+              <div className="rounded-2xl border p-4 space-y-3" style={{ backgroundColor: 'var(--surface)' }}>
+                <h3 className="text-xs font-bold uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>Informations passager</h3>
+                <div>
+                  <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>
+                    <User className="w-3 h-3 inline mr-1" />Nom complet
+                    <span className="ml-1 text-xs italic" style={{ color: 'var(--text-muted)' }}>(facultatif)</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={passenger.name}
+                    onChange={e => setPassenger({ ...passenger, name: e.target.value.toUpperCase() })}
+                    className="w-full px-3 py-2 rounded-lg border text-sm transition-colors"
+                    style={{ borderColor: 'var(--border)' }}
+                    placeholder="Ex: KOUASSI Jean"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>
+                    <Phone className="w-3 h-3 inline mr-1" />Téléphone *
+                  </label>
+                  <input
+                    type="tel"
+                    value={passenger.phone}
+                    onChange={e => setPassenger({ ...passenger, phone: e.target.value })}
+                    className="w-full px-3 py-2 rounded-lg border text-sm transition-colors"
+                    style={{ borderColor: 'var(--border)' }}
+                    placeholder="+225 07 XX XX XX XX"
+                  />
+                </div>
+              </div>
+
+              {/* Payment method */}
+              <div className="rounded-2xl border p-4 space-y-3" style={{ backgroundColor: 'var(--surface)' }}>
+                <h3 className="text-xs font-bold uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>Mode de paiement</h3>
+                <div className="grid grid-cols-2 gap-2">
+                  {PAYMENT_METHODS.map(m => (
+                    <button
+                      key={m.value}
+                      type="button"
+                      onClick={() => setPayment({ ...payment, method: m.value as any })}
+                      className="p-3 rounded-xl border-2 transition-all flex flex-col items-center gap-1.5 text-xs font-semibold"
+                      style={{
+                        borderColor: payment.method === m.value ? 'var(--primary)' : 'var(--border)',
+                        backgroundColor: payment.method === m.value ? 'var(--primary-light)' : 'transparent',
+                        color: payment.method === m.value ? 'var(--primary)' : 'var(--text-secondary)',
+                      }}
+                    >
+                      {m.icon}
+                      {m.label}
+                    </button>
+                  ))}
+                </div>
+
+                {payment.method === 'especes' && (
+                  <div className="space-y-2 pt-1">
+                    <label className="block text-xs font-medium" style={{ color: 'var(--text-secondary)' }}>
+                      Montant reçu (FCFA) *
+                    </label>
+                    <input
+                      type="number"
+                      value={payment.amount_received || ''}
+                      onChange={e => setPayment({ ...payment, amount_received: parseFloat(e.target.value) || 0 })}
+                      className="w-full px-3 py-2 rounded-lg border text-base font-bold"
+                      style={{ borderColor: 'var(--border)' }}
+                      placeholder="0"
+                    />
+                    {payment.amount_received > 0 && (
+                      <div className="rounded-lg px-3 py-2 flex justify-between items-center"
+                        style={{ backgroundColor: changeAmount >= 0 ? 'var(--success-light)' : 'var(--danger-light)' }}>
+                        <span className="text-xs font-semibold">Monnaie à rendre</span>
+                        <span className="text-lg font-black"
+                          style={{ color: changeAmount >= 0 ? 'var(--success)' : 'var(--danger)' }}>
+                          {formatCurrency(Math.max(0, changeAmount))}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {payment.method === 'mobile_money' && (
+                  <div className="space-y-2 pt-1">
+                    <select
+                      value={payment.mobile_provider}
+                      onChange={e => setPayment({ ...payment, mobile_provider: e.target.value })}
+                      className="w-full px-3 py-2 rounded-lg border text-sm"
+                      style={{ borderColor: 'var(--border)' }}
+                    >
+                      <option value="">Sélectionner l'opérateur...</option>
+                      <option value="orange_money">Orange Money</option>
+                      <option value="mtn_momo">MTN MoMo</option>
+                      <option value="wave">Wave</option>
+                      <option value="moov">Moov Money</option>
+                    </select>
+                    <input
+                      type="text"
+                      value={payment.reference}
+                      onChange={e => setPayment({ ...payment, reference: e.target.value })}
+                      className="w-full px-3 py-2 rounded-lg border text-sm"
+                      style={{ borderColor: 'var(--border)' }}
+                      placeholder="Référence transaction"
+                    />
+                  </div>
+                )}
+
+                {(payment.method === 'carte' || payment.method === 'virement') && (
+                  <div className="space-y-2 pt-1">
+                    {payment.method === 'virement' && (
+                      <div className="rounded-lg px-3 py-2 text-xs"
+                        style={{ backgroundColor: 'var(--warning-light)', color: 'var(--warning)' }}>
+                        Statut "En attente" jusqu'à validation du virement
+                      </div>
+                    )}
+                    <input
+                      type="text"
+                      value={payment.reference}
+                      onChange={e => setPayment({ ...payment, reference: e.target.value })}
+                      className="w-full px-3 py-2 rounded-lg border text-sm"
+                      style={{ borderColor: 'var(--border)' }}
+                      placeholder={payment.method === 'carte' ? 'Référence carte' : 'Référence virement'}
+                    />
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Confirm button — full width below both columns */}
+          {(() => {
+            const noSeats = hasSeatMap ? enrichedSelectedSeats.length === 0 : seatCount < 1;
+            const noPhone = !passenger.phone.trim();
+            const noPayment = !payment.method;
+            const insufficientCash = payment.method === 'especes' && payment.amount_received < totalAmount;
+            const disabled = processing || noSeats || noPhone || noPayment || insufficientCash;
+
+            return (
+              <button
+                type="button"
+                onClick={handleConfirmSale}
+                disabled={disabled}
+                className="w-full py-4 rounded-2xl font-bold text-base text-white flex items-center justify-center gap-2 transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-sm mt-3"
+                style={{ backgroundColor: isOnline ? 'var(--success)' : '#D97706' }}
+              >
+                {processing ? (
+                  <><div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />Traitement...</>
+                ) : noSeats ? (
+                  <><CheckCircle className="w-5 h-5 opacity-60" />Sélectionnez un siège</>
+                ) : noPhone ? (
+                  <><CheckCircle className="w-5 h-5 opacity-60" />Renseignez le téléphone</>
+                ) : noPayment ? (
+                  <><CheckCircle className="w-5 h-5 opacity-60" />Choisissez le paiement</>
+                ) : insufficientCash ? (
+                  <><CheckCircle className="w-5 h-5 opacity-60" />Montant insuffisant</>
+                ) : isOnline ? (
+                  <><CheckCircle className="w-5 h-5" />Confirmer la vente — {formatCurrency(totalAmount)}</>
+                ) : (
+                  <><WifiOff className="w-5 h-5" />Sauvegarder hors-ligne — {formatCurrency(totalAmount)}</>
+                )}
+              </button>
+            );
+          })()}
+        </div>
+      )}
+
+
+      {step === 'confirm' && confirmedTicket && (
+        <div className="space-y-4">
+          <div className="rounded-xl border overflow-hidden" style={{ backgroundColor: 'var(--surface)' }}>
+            <div className="p-6 flex items-center gap-4"
+                 style={{ backgroundColor: confirmedTicket.savedOffline ? '#D97706' : 'var(--success)', color: 'white' }}>
+              {confirmedTicket.savedOffline
+                ? <WifiOff className="w-10 h-10 flex-shrink-0" />
+                : <CheckCircle className="w-10 h-10 flex-shrink-0" />
+              }
+              <div>
+                <h2 className="text-xl font-black">
+                  {confirmedTicket.savedOffline ? 'Billet sauvegardé hors-ligne !' : 'Vente confirmée !'}
+                </h2>
+                <p className="text-sm opacity-90">
+                  {confirmedTicket.savedOffline
+                    ? 'Le billet sera synchronisé automatiquement au retour du réseau.'
+                    : 'Le billet a été enregistré avec succès dans le système'
+                  }
+                </p>
+              </div>
+            </div>
+
+            <div className="p-6" ref={printRef}>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div className="space-y-4">
+                  <div>
+                    <p className="text-xs font-semibold uppercase tracking-wide mb-1" style={{ color: 'var(--text-muted)' }}>
+                      Référence de réservation
+                    </p>
+                    <p className="text-xl font-black font-mono" style={{ color: 'var(--primary)' }}>
+                      {confirmedTicket.booking_reference}
+                    </p>
+                    {confirmedTicket.savedOffline && (
+                      <span className="inline-flex items-center gap-1 mt-1 px-2 py-0.5 rounded-full text-xs font-semibold"
+                            style={{ backgroundColor: '#FEF3C7', color: '#D97706' }}>
+                        <WifiOff className="w-3 h-3" />
+                        En attente de synchronisation
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <p className="text-xs font-semibold uppercase tracking-wide mb-1" style={{ color: 'var(--text-muted)' }}>Passager</p>
+                      <p className="font-bold text-sm">{confirmedTicket.passenger_name}</p>
+                      <p className="text-xs" style={{ color: 'var(--text-secondary)' }}>{confirmedTicket.passenger_phone}</p>
+                    </div>
+                    <div>
+                      <p className="text-xs font-semibold uppercase tracking-wide mb-1" style={{ color: 'var(--text-muted)' }}>
+                        Siège{confirmedTicket.seat_numbers.length > 1 ? 's' : ''}
+                      </p>
+                      <p className="font-bold text-sm font-mono">
+                        {[...confirmedTicket.seat_numbers].sort((a, b) => a.localeCompare(b, undefined, { numeric: true })).join(', ')}
+                      </p>
+                      <p className="text-xs" style={{ color: 'var(--text-secondary)' }}>
+                        {confirmedTicket.seat_numbers.length} place{confirmedTicket.seat_numbers.length > 1 ? 's' : ''}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div>
+                    <p className="text-xs font-semibold uppercase tracking-wide mb-1" style={{ color: 'var(--text-muted)' }}>Itinéraire</p>
+                    <div className="flex items-center gap-2">
+                      <span className="font-bold">{confirmedTicket.schedule.origin_city_name}</span>
+                      <ChevronRight className="w-4 h-4" style={{ color: 'var(--text-muted)' }} />
+                      <span className="font-bold">{confirmedTicket.schedule.destination_city_name}</span>
+                    </div>
+                    <p className="text-sm mt-0.5" style={{ color: 'var(--text-secondary)' }}>
+                      {format(new Date(confirmedTicket.schedule.departure_datetime), 'dd MMMM yyyy à HH:mm', { locale: fr })}
+                    </p>
+                    <p className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>
+                      Bus {confirmedTicket.schedule.buses?.registration_number} · {BUS_CLASS_LABELS[confirmedTicket.schedule.buses?.class] || 'Standard'}
+                    </p>
+                    {(confirmedTicket.boarding_station || confirmedTicket.alighting_station) && (
+                      <div className="mt-2 space-y-1">
+                        {confirmedTicket.boarding_station && (
+                          <div className="flex items-center gap-1.5 text-xs" style={{ color: 'var(--text-secondary)' }}>
+                            <LogIn className="w-3.5 h-3.5 flex-shrink-0" style={{ color: 'var(--success)' }} />
+                            <span>Embarquement : <span className="font-semibold">{confirmedTicket.boarding_station}</span></span>
+                          </div>
+                        )}
+                        {confirmedTicket.alighting_station && (
+                          <div className="flex items-center gap-1.5 text-xs" style={{ color: 'var(--text-secondary)' }}>
+                            <LogOut className="w-3.5 h-3.5 flex-shrink-0" style={{ color: 'var(--danger)' }} />
+                            <span>Débarquement : <span className="font-semibold">{confirmedTicket.alighting_station}</span></span>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+
+                  <div>
+                    <p className="text-xs font-semibold uppercase tracking-wide mb-1" style={{ color: 'var(--text-muted)' }}>Paiement</p>
+                    <p className="text-2xl font-black" style={{ color: 'var(--success)' }}>
+                      {formatCurrency(confirmedTicket.total_price)}
+                    </p>
+                    <p className="text-xs mt-0.5" style={{ color: 'var(--text-secondary)' }}>
+                      {({ especes: 'Espèces', carte: 'Carte bancaire', mobile_money: 'Mobile Money', virement: 'Virement' } as Record<string, string>)[confirmedTicket.payment_method] || confirmedTicket.payment_method}
+                      {confirmedTicket.change_amount && confirmedTicket.change_amount > 0 && (
+                        <span className="ml-2 font-semibold" style={{ color: 'var(--success)' }}>
+                          · Rendu: {formatCurrency(confirmedTicket.change_amount)}
+                        </span>
+                      )}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex flex-col items-center justify-center gap-3">
+                  <div className="p-4 bg-white rounded-xl border shadow-sm">
+                    <QRCodeSVG
+                      value={confirmedTicket.booking_reference}
+                      size={180}
+                      level="H"
+                      includeMargin
+                    />
+                  </div>
+                  <p className="text-xs text-center" style={{ color: 'var(--text-muted)' }}>
+                    {confirmedTicket.savedOffline
+                      ? 'Ce QR code sera valide après synchronisation'
+                      : 'Scanner à l\'embarquement'
+                    }
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <div className="px-6 pb-6 flex gap-3">
+              <button
+                onClick={generatePDF}
+                className="flex-1 py-3 rounded-xl font-bold flex items-center justify-center gap-2 border-2 transition-all hover:opacity-80"
+                style={{ borderColor: 'var(--primary)', color: 'var(--primary)' }}
+              >
+                <Printer className="w-5 h-5" />
+                Imprimer le billet
+              </button>
+              <button
+                onClick={resetSale}
+                className="flex-1 py-3 rounded-xl font-bold text-white flex items-center justify-center gap-2 transition-all hover:opacity-90"
+                style={{ backgroundColor: 'var(--primary)' }}
+              >
+                <RefreshCw className="w-5 h-5" />
+                Nouvelle vente
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showQueue && (
+        <OfflineQueue
+          tickets={tickets}
+          syncing={syncing}
+          isOnline={isOnline}
+          onClose={() => setShowQueue(false)}
+          onSyncNow={syncNow}
+          onDelete={deleteTicket}
+        />
+      )}
+    </div>
+  );
+}

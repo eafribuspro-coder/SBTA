@@ -1,0 +1,958 @@
+import React, { useState, useEffect } from 'react';
+import { Building2, Plus, CreditCard as Edit2, Trash2, Eye, Monitor, UserCheck, X, Package } from 'lucide-react';
+import { supabase } from '../../services/supabase';
+import toast from 'react-hot-toast';
+import { useNavigate } from 'react-router-dom';
+
+interface StationAgent {
+  id: string;
+  agent_id: string;
+  is_primary: boolean;
+  agent?: { full_name: string; phone: string | null };
+}
+
+interface Station {
+  id: string;
+  name: string;
+  city_id: string;
+  address: string | null;
+  phone: string | null;
+  email: string | null;
+  latitude: number | null;
+  longitude: number | null;
+  facilities: {
+    parking?: boolean;
+    wifi?: boolean;
+    restaurant?: boolean;
+    toilettes?: boolean;
+    salle_attente?: boolean;
+  };
+  display_screen_enabled: boolean;
+  is_active: boolean;
+  station_manager_id?: string | null;
+  agency_code?: string | null;
+  cities?: { name: string; region: string };
+  manager?: { id: string; full_name: string } | null;
+}
+
+interface Manager {
+  id: string;
+  full_name: string;
+  station_id?: string | null;
+}
+
+interface AgentColis {
+  id: string;
+  full_name: string;
+  phone: string | null;
+}
+
+interface City {
+  id: string;
+  name: string;
+  region: string;
+}
+
+const FACILITIES = [
+  { key: 'parking', label: 'Parking' },
+  { key: 'wifi', label: 'WiFi' },
+  { key: 'restaurant', label: 'Restaurant' },
+  { key: 'toilettes', label: 'Toilettes' },
+  { key: 'salle_attente', label: "Salle d'attente" }
+];
+
+export default function Stations() {
+  const navigate = useNavigate();
+  const [stations, setStations] = useState<Station[]>([]);
+  const [stationAgentsMap, setStationAgentsMap] = useState<Record<string, StationAgent[]>>({});
+  const [cities, setCities] = useState<City[]>([]);
+  const [managers, setManagers] = useState<Manager[]>([]);
+  const [agentsColis, setAgentsColis] = useState<AgentColis[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [showForm, setShowForm] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [selectedAgentIds, setSelectedAgentIds] = useState<string[]>([]);
+  const [primaryAgentId, setPrimaryAgentId] = useState<string | null>(null);
+
+  const [formData, setFormData] = useState({
+    name: '',
+    city_id: '',
+    address: '',
+    phone: '',
+    email: '',
+    latitude: 0,
+    longitude: 0,
+    facilities: {
+      parking: false,
+      wifi: false,
+      restaurant: false,
+      toilettes: false,
+      salle_attente: false
+    },
+    display_screen_enabled: false,
+    is_active: true,
+    station_manager_id: '',
+    agency_code: '',
+  });
+
+  useEffect(() => {
+    loadData();
+    loadCities();
+    loadManagers();
+    loadAgentsColis();
+  }, []);
+
+  const loadManagers = async () => {
+    try {
+      const { data, error } = await supabase
+        .from('users')
+        .select('id, first_name, last_name, full_name, station_id')
+        .eq('role', 'chef_gare')
+        .eq('is_active', true)
+        .order('first_name');
+
+      if (error) throw error;
+
+      const list: Manager[] = (data ?? []).map(u => ({
+        id: u.id,
+        full_name: u.full_name || `${u.first_name ?? ''} ${u.last_name ?? ''}`.trim() || u.id,
+        station_id: u.station_id,
+      }));
+
+      setManagers(list);
+    } catch (err) {
+      console.error('Erreur chargement chefs de gare:', err);
+    }
+  };
+
+  const loadAgentsColis = async () => {
+    try {
+      const { data, error } = await supabase
+        .from('users')
+        .select('id, first_name, last_name, full_name, phone')
+        .eq('role', 'agent_colis')
+        .eq('is_active', true)
+        .order('first_name');
+
+      if (error) throw error;
+
+      const list: AgentColis[] = (data ?? []).map(u => ({
+        id: u.id,
+        full_name: u.full_name || `${u.first_name ?? ''} ${u.last_name ?? ''}`.trim() || u.id,
+        phone: u.phone,
+      }));
+
+      setAgentsColis(list);
+    } catch (err) {
+      console.error('Erreur chargement agents colis:', err);
+    }
+  };
+
+  const loadCities = async () => {
+    try {
+      const { data, error } = await supabase
+        .from('cities')
+        .select('id, name, region')
+        .eq('is_active', true)
+        .order('name');
+
+      if (error) throw error;
+      setCities(data || []);
+    } catch (error: any) {
+      toast.error('Erreur de chargement des villes');
+    }
+  };
+
+  const loadData = async () => {
+    try {
+      const [stationsRes, agentsRes] = await Promise.all([
+        supabase
+          .from('stations')
+          .select('*, cities(name, region), manager:station_manager_id(id, full_name)')
+          .order('name'),
+        supabase
+          .from('station_agents')
+          .select('id, station_id, agent_id, is_primary, agent:agent_id(full_name, phone)')
+          .order('is_primary', { ascending: false })
+          .order('created_at', { ascending: true }),
+      ]);
+
+      if (stationsRes.error) throw stationsRes.error;
+      setStations(stationsRes.data || []);
+
+      const map: Record<string, StationAgent[]> = {};
+      for (const row of agentsRes.data ?? []) {
+        const sid = (row as any).station_id;
+        if (!map[sid]) map[sid] = [];
+        map[sid].push(row as any);
+      }
+      setStationAgentsMap(map);
+    } catch (error: any) {
+      toast.error('Erreur de chargement');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+
+    try {
+      const dataToSubmit = {
+        name: formData.name,
+        city_id: formData.city_id,
+        address: formData.address || null,
+        phone: formData.phone || null,
+        email: formData.email || null,
+        latitude: formData.latitude || null,
+        longitude: formData.longitude || null,
+        facilities: formData.facilities,
+        display_screen_enabled: formData.display_screen_enabled,
+        is_active: formData.is_active,
+        station_manager_id: formData.station_manager_id || null,
+        agency_code: formData.agency_code || null,
+      };
+
+      let savedStationId = editingId;
+
+      if (editingId) {
+        const { error } = await supabase
+          .from('stations')
+          .update(dataToSubmit)
+          .eq('id', editingId);
+
+        if (error) throw error;
+        toast.success('Gare mise à jour avec succès');
+      } else {
+        const { data: inserted, error } = await supabase
+          .from('stations')
+          .insert([dataToSubmit])
+          .select('id')
+          .single();
+
+        if (error) throw error;
+        savedStationId = inserted.id;
+        toast.success('Gare créée avec succès');
+      }
+
+      if (savedStationId) {
+        await syncStationAgents(savedStationId, selectedAgentIds, primaryAgentId);
+      }
+
+      setShowForm(false);
+      setEditingId(null);
+      resetForm();
+      loadData();
+    } catch (error: any) {
+      console.error('Erreur:', error);
+      toast.error(error.message || 'Une erreur est survenue');
+    }
+  };
+
+  const syncStationAgents = async (stationId: string, agentIds: string[], primaryId: string | null) => {
+    const { data: existing } = await supabase
+      .from('station_agents')
+      .select('id, agent_id')
+      .eq('station_id', stationId);
+
+    const existingIds = new Set((existing ?? []).map(r => r.agent_id));
+    const targetIds = new Set(agentIds);
+
+    const toRemove = (existing ?? []).filter(r => !targetIds.has(r.agent_id));
+    const toAdd = agentIds.filter(id => !existingIds.has(id));
+
+    if (toRemove.length > 0) {
+      await supabase
+        .from('station_agents')
+        .delete()
+        .in('id', toRemove.map(r => r.id));
+    }
+
+    if (toAdd.length > 0) {
+      await supabase
+        .from('station_agents')
+        .insert(toAdd.map(agentId => ({
+          station_id: stationId,
+          agent_id: agentId,
+          is_primary: agentId === primaryId,
+        })));
+    }
+
+    if (primaryId) {
+      await supabase
+        .from('station_agents')
+        .update({ is_primary: false })
+        .eq('station_id', stationId)
+        .neq('agent_id', primaryId);
+
+      await supabase
+        .from('station_agents')
+        .update({ is_primary: true })
+        .eq('station_id', stationId)
+        .eq('agent_id', primaryId);
+    }
+  };
+
+  const handleEdit = (station: Station) => {
+    const agents = stationAgentsMap[station.id] ?? [];
+    const ids = agents.map(a => a.agent_id);
+    const primary = agents.find(a => a.is_primary);
+
+    setFormData({
+      name: station.name,
+      city_id: station.city_id,
+      address: station.address || '',
+      phone: station.phone || '',
+      email: station.email || '',
+      latitude: station.latitude || 0,
+      longitude: station.longitude || 0,
+      facilities: station.facilities || {
+        parking: false,
+        wifi: false,
+        restaurant: false,
+        toilettes: false,
+        salle_attente: false
+      },
+      display_screen_enabled: station.display_screen_enabled || false,
+      is_active: station.is_active,
+      station_manager_id: station.station_manager_id || '',
+      agency_code: station.agency_code || '',
+    });
+    setSelectedAgentIds(ids);
+    setPrimaryAgentId(primary?.agent_id ?? (ids[0] || null));
+    setEditingId(station.id);
+    setShowForm(true);
+  };
+
+  const handleDelete = async (id: string) => {
+    if (!confirm('Voulez-vous vraiment supprimer cette gare?')) return;
+
+    try {
+      const { error } = await supabase
+        .from('stations')
+        .delete()
+        .eq('id', id);
+
+      if (error) throw error;
+      toast.success('Gare supprimée');
+      loadData();
+    } catch (error: any) {
+      toast.error(error.message);
+    }
+  };
+
+  const resetForm = () => {
+    setFormData({
+      name: '',
+      city_id: '',
+      address: '',
+      phone: '',
+      email: '',
+      latitude: 0,
+      longitude: 0,
+      facilities: {
+        parking: false,
+        wifi: false,
+        restaurant: false,
+        toilettes: false,
+        salle_attente: false
+      },
+      display_screen_enabled: false,
+      is_active: true,
+      station_manager_id: '',
+      agency_code: '',
+    });
+    setSelectedAgentIds([]);
+    setPrimaryAgentId(null);
+  };
+
+  const handleFacilityChange = (key: string, checked: boolean) => {
+    setFormData({
+      ...formData,
+      facilities: {
+        ...formData.facilities,
+        [key]: checked
+      }
+    });
+  };
+
+  const handleLocationSelect = () => {
+    if (navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(
+        (position) => {
+          setFormData({
+            ...formData,
+            latitude: position.coords.latitude,
+            longitude: position.coords.longitude
+          });
+          toast.success('Position GPS récupérée');
+        },
+        () => {
+          toast.error('Impossible de récupérer la position GPS');
+        }
+      );
+    } else {
+      toast.error('Géolocalisation non supportée');
+    }
+  };
+
+  const toggleAgent = (agentId: string) => {
+    setSelectedAgentIds(prev => {
+      const next = prev.includes(agentId)
+        ? prev.filter(id => id !== agentId)
+        : [...prev, agentId];
+
+      if (!next.includes(primaryAgentId ?? '')) {
+        setPrimaryAgentId(next[0] || null);
+      }
+      return next;
+    });
+  };
+
+  const availableAgents = agentsColis.filter(a => !selectedAgentIds.includes(a.id));
+
+  if (loading) {
+    return <div className="p-8">Chargement...</div>;
+  }
+
+  return (
+    <div className="p-8">
+      <div className="flex justify-between items-center mb-8">
+        <div>
+          <h1 className="text-3xl font-bold mb-2" style={{ color: 'var(--text-primary)' }}>
+            Gares
+          </h1>
+          <p style={{ color: 'var(--text-secondary)' }}>
+            {stations.length} gares au total
+          </p>
+        </div>
+        <button
+          onClick={() => setShowForm(true)}
+          className="px-6 py-3 rounded-lg flex items-center gap-2 text-white font-medium"
+          style={{ backgroundColor: 'var(--primary)' }}
+        >
+          <Plus className="w-5 h-5" />
+          Nouvelle gare
+        </button>
+      </div>
+
+      {showForm && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-xl w-full max-w-2xl max-h-[90vh] overflow-y-auto">
+            <div className="p-6 border-b sticky top-0 bg-white z-10">
+              <h2 className="text-2xl font-bold">
+                {editingId ? 'Modifier' : 'Nouvelle'} gare
+              </h2>
+            </div>
+
+            <form onSubmit={handleSubmit} className="p-6">
+              <div className="space-y-4">
+                <div>
+                  <label className="block mb-2 font-medium">Nom de la gare *</label>
+                  <input
+                    type="text"
+                    value={formData.name}
+                    onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+                    className="w-full p-3 border rounded-lg"
+                    required
+                  />
+                </div>
+
+                <div>
+                  <label className="block mb-2 font-medium">Ville *</label>
+                  <select
+                    value={formData.city_id}
+                    onChange={(e) => setFormData({ ...formData, city_id: e.target.value })}
+                    className="w-full p-3 border rounded-lg"
+                    required
+                  >
+                    <option value="">Sélectionner une ville</option>
+                    {cities.map((city) => (
+                      <option key={city.id} value={city.id}>
+                        {city.name} ({city.region})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block mb-2 font-medium">Adresse</label>
+                  <textarea
+                    value={formData.address}
+                    onChange={(e) => setFormData({ ...formData, address: e.target.value })}
+                    className="w-full p-3 border rounded-lg"
+                    rows={3}
+                  />
+                </div>
+
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block mb-2 font-medium">Téléphone</label>
+                    <input
+                      type="tel"
+                      value={formData.phone}
+                      onChange={(e) => setFormData({ ...formData, phone: e.target.value })}
+                      className="w-full p-3 border rounded-lg"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block mb-2 font-medium">Email</label>
+                    <input
+                      type="email"
+                      value={formData.email}
+                      onChange={(e) => setFormData({ ...formData, email: e.target.value })}
+                      className="w-full p-3 border rounded-lg"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <div className="flex justify-between items-center mb-2">
+                    <label className="font-medium">Géolocalisation GPS</label>
+                    <button
+                      type="button"
+                      onClick={handleLocationSelect}
+                      className="text-sm px-3 py-1 rounded-lg border"
+                      style={{ color: 'var(--primary)', borderColor: 'var(--primary)' }}
+                    >
+                      Utiliser ma position
+                    </button>
+                  </div>
+                  <div className="text-xs mb-2" style={{ color: 'var(--text-muted)' }}>
+                    Ou entrez manuellement les coordonnées GPS
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block mb-2 font-medium">Latitude</label>
+                    <input
+                      type="number"
+                      value={formData.latitude || ''}
+                      onChange={(e) => setFormData({ ...formData, latitude: e.target.value ? parseFloat(e.target.value) : 0 })}
+                      className="w-full p-3 border rounded-lg"
+                      step="0.000001"
+                      placeholder="Ex: 5.304923"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block mb-2 font-medium">Longitude</label>
+                    <input
+                      type="number"
+                      value={formData.longitude || ''}
+                      onChange={(e) => setFormData({ ...formData, longitude: e.target.value ? parseFloat(e.target.value) : 0 })}
+                      className="w-full p-3 border rounded-lg"
+                      step="0.000001"
+                      placeholder="Ex: -4.010662"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block mb-3 font-medium">Équipements disponibles</label>
+                  <div className="grid grid-cols-2 gap-3">
+                    {FACILITIES.map((facility) => (
+                      <div key={facility.key} className="flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          id={facility.key}
+                          checked={formData.facilities[facility.key as keyof typeof formData.facilities] || false}
+                          onChange={(e) => handleFacilityChange(facility.key, e.target.checked)}
+                          className="w-4 h-4"
+                        />
+                        <label htmlFor={facility.key} className="text-sm">{facility.label}</label>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* ── Agents courrier (multi-select) ── */}
+                <div>
+                  <label className="block mb-2 font-medium">Agents courrier affectes</label>
+
+                  {selectedAgentIds.length > 0 && (
+                    <div className="space-y-2 mb-3">
+                      {selectedAgentIds.map(agentId => {
+                        const agent = agentsColis.find(a => a.id === agentId);
+                        if (!agent) return null;
+                        const isPrimary = primaryAgentId === agentId;
+                        return (
+                          <div
+                            key={agentId}
+                            className="flex items-center justify-between p-3 rounded-lg border"
+                            style={{
+                              backgroundColor: isPrimary ? 'var(--success-light)' : 'var(--neutral-50)',
+                              borderColor: isPrimary ? 'var(--success)' : 'var(--neutral-200)',
+                            }}
+                          >
+                            <div className="flex items-center gap-3">
+                              <Package className="w-4 h-4" style={{ color: isPrimary ? 'var(--success)' : 'var(--neutral-400)' }} />
+                              <div>
+                                <span className="text-sm font-medium">{agent.full_name}</span>
+                                {agent.phone && (
+                                  <span className="text-xs ml-2" style={{ color: 'var(--text-muted)' }}>
+                                    {agent.phone}
+                                  </span>
+                                )}
+                              </div>
+                              {isPrimary && (
+                                <span
+                                  className="px-2 py-0.5 rounded text-xs font-semibold"
+                                  style={{ backgroundColor: 'var(--success)', color: 'white' }}
+                                >
+                                  Principal
+                                </span>
+                              )}
+                            </div>
+                            <div className="flex items-center gap-2">
+                              {!isPrimary && (
+                                <button
+                                  type="button"
+                                  onClick={() => setPrimaryAgentId(agentId)}
+                                  className="text-xs px-2 py-1 rounded border hover:bg-gray-100 transition-colors"
+                                  style={{ color: 'var(--primary)', borderColor: 'var(--primary)' }}
+                                >
+                                  Rendre principal
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                onClick={() => toggleAgent(agentId)}
+                                className="p-1 rounded hover:bg-red-50 transition-colors"
+                              >
+                                <X className="w-4 h-4" style={{ color: 'var(--danger)' }} />
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  {agentsColis.length === 0 ? (
+                    <div className="w-full p-3 border rounded-lg text-sm" style={{ color: 'var(--text-muted)', backgroundColor: 'var(--neutral-50)' }}>
+                      Aucun agent courrier disponible — creez d'abord un utilisateur avec le role "agent_colis"
+                    </div>
+                  ) : availableAgents.length > 0 ? (
+                    <select
+                      value=""
+                      onChange={(e) => {
+                        if (e.target.value) {
+                          toggleAgent(e.target.value);
+                          if (selectedAgentIds.length === 0) {
+                            setPrimaryAgentId(e.target.value);
+                          }
+                        }
+                      }}
+                      className="w-full p-3 border rounded-lg"
+                    >
+                      <option value="">+ Ajouter un agent courrier...</option>
+                      {availableAgents.map(a => (
+                        <option key={a.id} value={a.id}>
+                          {a.full_name}{a.phone ? ` (${a.phone})` : ''}
+                        </option>
+                      ))}
+                    </select>
+                  ) : selectedAgentIds.length > 0 ? (
+                    <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                      Tous les agents courrier sont deja affectes
+                    </p>
+                  ) : null}
+
+                  <p className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>
+                    L'agent principal est utilise sur les recus courrier (VILLE EXP / VILLE DES)
+                  </p>
+                </div>
+
+                <div>
+                  <label className="block mb-2 font-medium">Code agence</label>
+                  <input
+                    type="text"
+                    value={formData.agency_code}
+                    onChange={(e) => setFormData({ ...formData, agency_code: e.target.value })}
+                    className="w-full p-3 border rounded-lg"
+                    placeholder="Ex: 01, 02, 03..."
+                    maxLength={10}
+                  />
+                  <p className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>
+                    Identifiant unique de l'agence, utilise comme prefixe dans les codes courrier
+                  </p>
+                </div>
+
+                <div>
+                  <label className="block mb-2 font-medium">Chef de gare responsable</label>
+                  {managers.length === 0 ? (
+                    <div className="w-full p-3 border rounded-lg text-sm" style={{ color: 'var(--text-muted)', backgroundColor: 'var(--neutral-50)' }}>
+                      Aucun chef de gare disponible — créez d'abord un utilisateur avec le rôle "chef_gare"
+                    </div>
+                  ) : (
+                    <select
+                      value={formData.station_manager_id}
+                      onChange={(e) => setFormData({ ...formData, station_manager_id: e.target.value })}
+                      className="w-full p-3 border rounded-lg"
+                    >
+                      <option value="">Aucun responsable assigné</option>
+                      {managers.map(m => {
+                        const alreadyAssigned = m.station_id && m.station_id !== editingId;
+                        return (
+                          <option key={m.id} value={m.id}>
+                            {m.full_name}{alreadyAssigned ? ' (déjà assigné à une autre gare)' : ''}
+                          </option>
+                        );
+                      })}
+                    </select>
+                  )}
+                </div>
+
+                <div className="flex items-center gap-2 p-4 border rounded-lg" style={{ backgroundColor: 'var(--neutral-50)' }}>
+                  <input
+                    type="checkbox"
+                    id="display_screen"
+                    checked={formData.display_screen_enabled}
+                    onChange={(e) => setFormData({ ...formData, display_screen_enabled: e.target.checked })}
+                    className="w-4 h-4"
+                  />
+                  <label htmlFor="display_screen" className="font-medium">
+                    Activer l'écran d'affichage aéroport
+                  </label>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    id="is_active"
+                    checked={formData.is_active}
+                    onChange={(e) => setFormData({ ...formData, is_active: e.target.checked })}
+                    className="w-4 h-4"
+                  />
+                  <label htmlFor="is_active" className="font-medium">Gare active</label>
+                </div>
+              </div>
+
+              <div className="flex gap-4 mt-6">
+                <button
+                  type="submit"
+                  className="px-6 py-3 rounded-lg text-white font-medium"
+                  style={{ backgroundColor: 'var(--primary)' }}
+                >
+                  {editingId ? 'Mettre à jour' : 'Créer'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { setShowForm(false); setEditingId(null); resetForm(); }}
+                  className="px-6 py-3 rounded-lg border"
+                >
+                  Annuler
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      <div className="bg-white rounded-xl border overflow-hidden">
+        <table className="w-full">
+          <thead style={{ backgroundColor: 'var(--neutral-100)' }}>
+            <tr>
+              <th className="text-left p-4 font-semibold">Gare</th>
+              <th className="text-left p-4 font-semibold">Ville</th>
+              <th className="text-left p-4 font-semibold">Chef de gare</th>
+              <th className="text-left p-4 font-semibold">Agents courrier</th>
+              <th className="text-left p-4 font-semibold">Code agence</th>
+              <th className="text-left p-4 font-semibold">Contact</th>
+              <th className="text-left p-4 font-semibold">Équipements</th>
+              <th className="text-left p-4 font-semibold">Affichage</th>
+              <th className="text-left p-4 font-semibold">Statut</th>
+              <th className="text-left p-4 font-semibold">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {stations.map((station) => {
+              const agents = stationAgentsMap[station.id] ?? [];
+              return (
+                <tr key={station.id} className="border-t hover:bg-gray-50">
+                  <td className="p-4">
+                    <div className="flex items-center gap-2">
+                      <Building2 className="w-4 h-4" style={{ color: 'var(--primary)' }} />
+                      <div>
+                        <div className="font-bold">{station.name}</div>
+                        {station.address && (
+                          <div className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                            {station.address}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </td>
+                  <td className="p-4">
+                    {station.cities ? (
+                      <div>
+                        <div className="font-medium">{station.cities.name}</div>
+                        <div className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                          {station.cities.region}
+                        </div>
+                      </div>
+                    ) : (
+                      <span className="text-xs" style={{ color: 'var(--text-muted)' }}>Non assignée</span>
+                    )}
+                  </td>
+                  <td className="p-4">
+                    {station.manager ? (
+                      <div className="flex items-center gap-2">
+                        <UserCheck className="w-4 h-4" style={{ color: 'var(--primary)' }} />
+                        <span className="text-sm font-medium">{(station.manager as any).full_name}</span>
+                      </div>
+                    ) : (
+                      <span className="text-xs" style={{ color: 'var(--text-muted)' }}>Non assigné</span>
+                    )}
+                  </td>
+                  <td className="p-4">
+                    {agents.length > 0 ? (
+                      <div className="space-y-1">
+                        {agents.map(sa => (
+                          <div key={sa.id} className="flex items-center gap-1.5">
+                            <Package className="w-3.5 h-3.5" style={{ color: sa.is_primary ? 'var(--success)' : 'var(--neutral-400)' }} />
+                            <span className="text-sm font-medium">{(sa.agent as any)?.full_name}</span>
+                            {sa.is_primary && (
+                              <span
+                                className="px-1.5 py-0.5 rounded text-[10px] font-semibold leading-none"
+                                style={{ backgroundColor: 'var(--success-light)', color: 'var(--success)' }}
+                              >
+                                P
+                              </span>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <span className="text-xs" style={{ color: 'var(--text-muted)' }}>Aucun agent</span>
+                    )}
+                  </td>
+                  <td className="p-4">
+                    {station.agency_code ? (
+                      <span className="px-3 py-1 rounded-full text-xs font-bold" style={{ backgroundColor: 'var(--primary-light)', color: 'var(--primary)' }}>
+                        {station.agency_code}
+                      </span>
+                    ) : (
+                      <span className="text-xs" style={{ color: 'var(--text-muted)' }}>Non defini</span>
+                    )}
+                  </td>
+                  <td className="p-4">
+                    <div className="text-sm">
+                      {station.phone && <div>{station.phone}</div>}
+                      {station.email && (
+                        <div className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                          {station.email}
+                        </div>
+                      )}
+                      {!station.phone && !station.email && (
+                        <span className="text-xs" style={{ color: 'var(--text-muted)' }}>N/A</span>
+                      )}
+                    </div>
+                  </td>
+                  <td className="p-4">
+                    <div className="flex gap-1 flex-wrap">
+                      {station.facilities?.parking && (
+                        <span className="px-2 py-1 rounded text-xs" style={{ backgroundColor: 'var(--neutral-200)' }}>
+                          Parking
+                        </span>
+                      )}
+                      {station.facilities?.wifi && (
+                        <span className="px-2 py-1 rounded text-xs" style={{ backgroundColor: 'var(--neutral-200)' }}>
+                          WiFi
+                        </span>
+                      )}
+                      {station.facilities?.restaurant && (
+                        <span className="px-2 py-1 rounded text-xs" style={{ backgroundColor: 'var(--neutral-200)' }}>
+                          Restaurant
+                        </span>
+                      )}
+                      {station.facilities?.toilettes && (
+                        <span className="px-2 py-1 rounded text-xs" style={{ backgroundColor: 'var(--neutral-200)' }}>
+                          Toilettes
+                        </span>
+                      )}
+                      {station.facilities?.salle_attente && (
+                        <span className="px-2 py-1 rounded text-xs" style={{ backgroundColor: 'var(--neutral-200)' }}>
+                          Salle d'attente
+                        </span>
+                      )}
+                      {!station.facilities || Object.values(station.facilities).every(v => !v) && (
+                        <span className="text-xs" style={{ color: 'var(--text-muted)' }}>Aucun</span>
+                      )}
+                    </div>
+                  </td>
+                  <td className="p-4">
+                    <span
+                      className="px-3 py-1 rounded-full text-xs font-medium"
+                      style={{
+                        backgroundColor: station.display_screen_enabled ? 'var(--primary-light)' : 'var(--neutral-200)',
+                        color: station.display_screen_enabled ? 'var(--primary)' : 'var(--neutral-600)'
+                      }}
+                    >
+                      {station.display_screen_enabled ? 'Activé' : 'Désactivé'}
+                    </span>
+                  </td>
+                  <td className="p-4">
+                    <span
+                      className="px-3 py-1 rounded-full text-xs font-medium"
+                      style={{
+                        backgroundColor: station.is_active ? 'var(--success-light)' : 'var(--neutral-200)',
+                        color: station.is_active ? 'var(--success)' : 'var(--neutral-600)'
+                      }}
+                    >
+                      {station.is_active ? 'Active' : 'Inactive'}
+                    </span>
+                  </td>
+                  <td className="p-4">
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => navigate(`/admin/stations/${station.id}`)}
+                        className="p-2 hover:bg-gray-100 rounded-lg"
+                        title="Voir détails"
+                      >
+                        <Eye className="w-4 h-4" style={{ color: 'var(--primary)' }} />
+                      </button>
+                      {station.display_screen_enabled && (
+                        <button
+                          onClick={() => window.open(`/display/station/${station.id}`, '_blank')}
+                          className="p-2 hover:bg-gray-100 rounded-lg"
+                          title="Ecran d'affichage"
+                        >
+                          <Monitor className="w-4 h-4" style={{ color: 'var(--success)' }} />
+                        </button>
+                      )}
+                      <button
+                        onClick={() => handleEdit(station)}
+                        className="p-2 hover:bg-gray-100 rounded-lg"
+                        title="Modifier"
+                      >
+                        <Edit2 className="w-4 h-4" style={{ color: 'var(--primary)' }} />
+                      </button>
+                      <button
+                        onClick={() => handleDelete(station.id)}
+                        className="p-2 hover:bg-gray-100 rounded-lg"
+                        title="Supprimer"
+                      >
+                        <Trash2 className="w-4 h-4" style={{ color: 'var(--danger)' }} />
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+
+        {stations.length === 0 && (
+          <div className="text-center py-12">
+            <Building2 className="w-16 h-16 mx-auto mb-4" style={{ color: 'var(--neutral-400)' }} />
+            <p style={{ color: 'var(--text-secondary)' }}>Aucune gare trouvée</p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

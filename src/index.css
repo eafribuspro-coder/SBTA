@@ -1,0 +1,197 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --primary: #0B7439;
+  --primary-dark: #085c2d;
+  --primary-light: #d4edda;
+  --secondary: #AF3029;
+  --secondary-light: #f8d7d5;
+  --bg-app: #FFFFFF;
+  --bg-subtle: #F8FAF8;
+  --surface: #FFFFFF;
+  --surface-raised: #F4F7F5;
+  --border: #E2EAE5;
+  --border-strong: #C8D8CC;
+  --text-primary: #1A2E22;
+  --text-secondary: #4A6B55;
+  --text-muted: #8AA898;
+  --text-on-primary: #FFFFFF;
+  --text-on-secondary: #FFFFFF;
+  --success: #0B7439;
+  --success-light: #d4edda;
+  --warning: #D97706;
+  --warning-light: #FEF3C7;
+  --danger: #AF3029;
+  --danger-light: #f8d7d5;
+  --info: #1D6FA4;
+  --info-light: #DBEAFE;
+  --status-disponible: #0B7439;
+  --status-en-service: #1D6FA4;
+  --status-panne-route: #AF3029;
+  --status-reception-garage: #D97706;
+  --status-diagnostic: #D97706;
+  --status-attente-ot: #92400E;
+  --status-maintenance: #1D6FA4;
+  --status-controle-qualite: #7C3AED;
+  --status-hors-service: #6B7280;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background-color: var(--bg-app);
+  color: var(--text-primary);
+  overflow-x: hidden;
+}
+
+/* Safe area support for notched phones */
+@supports (padding-bottom: env(safe-area-inset-bottom)) {
+  .bottom-nav-safe {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+}
+
+/* Bottom nav clearance on mobile — 60px nav + safe area + 8px breathing room */
+@media (max-width: 1023px) {
+  .pb-bottom-nav {
+    padding-bottom: calc(68px + env(safe-area-inset-bottom, 0px));
+  }
+}
+
+/* Smooth transitions on interactive elements */
+a, button { transition: background-color 0.15s, color 0.15s, opacity 0.15s; }
+
+/* ─── SBTA mobile splash fade ──────────────────────────────────────────── */
+@keyframes sbta-splash-fade {
+  0%   { opacity: 0; transform: scale(0.94); }
+  25%  { opacity: 1; transform: scale(1); }
+  80%  { opacity: 1; transform: scale(1); }
+  100% { opacity: 0; transform: scale(1.02); }
+}
+.sbta-splash-logo {
+  animation: sbta-splash-fade 2.6s ease-in-out forwards;
+}
+
+/* Remove default tap highlight on mobile */
+* { -webkit-tap-highlight-color: transparent; }
+
+/* ─── Sticky form actions — fixed above bottom nav on mobile, normal on desktop ── */
+@media (max-width: 1023px) {
+  .sticky-form-actions {
+    position: fixed;
+    left: 0;
+    right: 0;
+    z-index: 20;
+    padding: 12px;
+    bottom: calc(60px + env(safe-area-inset-bottom, 0px));
+    box-shadow: 0 -2px 8px rgba(0, 0, 0, 0.06);
+  }
+}
+@media (min-width: 1024px) {
+  .sticky-form-actions {
+    position: static;
+    padding: 0 0 16px 0;
+    box-shadow: none;
+  }
+}
+
+/* ─── Seat editor cell styles (SBTA charte) ─────────────────────────────── */
+@layer components {
+  .seat-cell-editor {
+    width: 44px;
+    height: 44px;
+    border-radius: 8px;
+    font-weight: 700;
+    font-size: 11px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: transform 0.1s, box-shadow 0.1s;
+    cursor: pointer;
+    user-select: none;
+    flex-shrink: 0;
+  }
+
+  .cell-normal {
+    background: #d4edda;
+    border: 2px solid #0B7439;
+    color: #0B7439;
+  }
+
+  .cell-vip {
+    background: #FEF3C7;
+    border: 2px solid #D97706;
+    color: #92400E;
+  }
+
+  .cell-couchette {
+    background: #DBEAFE;
+    border: 2px solid #1D6FA4;
+    color: #1D6FA4;
+  }
+
+  .cell-hors-svc {
+    background: #F3F4F6;
+    border: 2px solid #9CA3AF;
+    color: #9CA3AF;
+  }
+
+  .cell-aisle {
+    background: transparent;
+    border: 2px dashed #E2EAE5;
+    color: transparent;
+    cursor: default;
+  }
+
+  .cell-selected {
+    outline: 3px solid #0B7439;
+    outline-offset: 2px;
+    transform: scale(1.05);
+  }
+
+  /* Agent-colis mobile: darker green tones for better readability */
+  @media (max-width: 639px) {
+    .agent-colis-theme {
+      --bg-subtle: #EBF2EC;
+      --surface: #FAFCFA;
+      --surface-raised: #E4EDE6;
+      --border: #C8D8CC;
+      --border-strong: #A8C4AE;
+      --text-primary: #112A18;
+      --text-secondary: #3A5D45;
+      --text-muted: #5E8A6C;
+    }
+  }
+
+  .cell-empty {
+    background: #FFF7ED;
+    border: 2px dashed #D97706;
+    color: #D97706;
+    font-size: 10px;
+  }
+
+  /* ─── Wizard tab styles ───────────────────────────────────────────────── */
+  .tab-active {
+    background: #0B7439;
+    color: white;
+    border-radius: 8px;
+    padding: 8px 16px;
+    font-weight: 700;
+  }
+
+  .tab-inactive {
+    background: #F4F7F5;
+    color: #4A6B55;
+    border-radius: 8px;
+    padding: 8px 16px;
+  }
+}

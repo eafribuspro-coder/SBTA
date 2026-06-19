@@ -1,0 +1,631 @@
+import React, { useState, useEffect } from 'react';
+import { Bus, Plus, CreditCard as Edit2, Eye, Search, Calendar, AlertTriangle, LayoutGrid, RefreshCw } from 'lucide-react';
+import { supabase } from '../../services/supabase';
+import toast from 'react-hot-toast';
+import StatusBadge from '../../components/shared/StatusBadge';
+import FillRateBar from '../../components/bus/FillRateBar';
+import BusWizard from '../../components/bus/BusWizard';
+import { generateSeatLayout } from '../../utils/generateSeatLayout';
+
+interface SeatConfigDetail {
+  id: string;
+  name: string;
+  total_capacity: number;
+  seat_layout: any;
+  grid_layout: any;
+  rows: number;
+  left_columns: number;
+  right_columns: number;
+  back_row: boolean;
+  has_back_row: boolean;
+  back_row_seats: number;
+  aisle_after_columns: number[] | null;
+  total_columns: number | null;
+  driver_position: string | null;
+  deck_level: string | null;
+}
+
+interface BusData {
+  id: string;
+  registration_number: string;
+  brand: string;
+  model: string;
+  year: number;
+  class: 'standard' | 'vip' | 'executive';
+  company_id: string;
+  seat_config_id: string;
+  capacity: number;
+  status: 'disponible' | 'en_service' | 'panne_route' | 'reception_garage' | 'diagnostic' | 'attente_ot' | 'maintenance' | 'controle_qualite' | 'hors_service';
+  fuel_type: string;
+  fuel_capacity: number;
+  fuel_consumption: number;
+  insurance_expiry: string;
+  vignette_expiry: string;
+  technical_inspection_expiry: string;
+  photo_url?: string;
+  amenities: string[];
+  fill_rate_current: number;
+  bus_deck_type?: string;
+  driver_position?: string;
+  sleeping_type?: string;
+  max_allowed_capacity?: number;
+  lower_deck_config_id?: string;
+  upper_deck_config_id?: string;
+  companies?: { name: string };
+  bus_seat_config?: SeatConfigDetail;
+}
+
+interface Company {
+  id: string;
+  name: string;
+  code?: string;
+  parent_id?: string | null;
+  is_group?: boolean;
+}
+
+interface SeatConfig {
+  id: string;
+  name: string;
+  total_capacity: number;
+}
+
+interface Amenity {
+  id: string;
+  name: string;
+  icon: string;
+}
+
+const emptyGeneralData = () => ({
+  registration_number: '',
+  brand: '',
+  model: '',
+  year: new Date().getFullYear(),
+  class: 'standard' as 'standard' | 'vip' | 'executive',
+  company_id: '',
+  fuel_type: 'diesel',
+  fuel_capacity: 200,
+  fuel_consumption: 25,
+  insurance_expiry: '',
+  vignette_expiry: '',
+  technical_inspection_expiry: '',
+  photo_url: '',
+  amenities: [] as string[],
+});
+
+export default function Buses() {
+  const [buses, setBuses] = useState<BusData[]>([]);
+  const [companies, setCompanies] = useState<Company[]>([]);
+  const [seatConfigs, setSeatConfigs] = useState<SeatConfig[]>([]);
+  const [amenities, setAmenities] = useState<Amenity[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [showWizard, setShowWizard] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [wizardInitialData, setWizardInitialData] = useState(emptyGeneralData());
+  const [existingBusConfig, setExistingBusConfig] = useState<any>(undefined);
+  const [viewingBus, setViewingBus] = useState<BusData | null>(null);
+  const [repairingId, setRepairingId] = useState<string | null>(null);
+
+  const [filters, setFilters] = useState({
+    company: '',
+    class: '',
+    status: '',
+    search: ''
+  });
+
+  useEffect(() => {
+    loadData();
+  }, []);
+
+  const loadData = async () => {
+    try {
+      const [busesRes, companiesRes, seatConfigsRes, amenitiesRes] = await Promise.all([
+        supabase
+          .from('buses')
+          .select('*, companies(name), bus_seat_config!buses_seat_config_id_fkey(id, name, total_capacity, seat_layout, grid_layout, rows, left_columns, right_columns, back_row, has_back_row, back_row_seats, aisle_after_columns, total_columns, driver_position, deck_level)')
+          .order('registration_number'),
+        supabase.from('companies').select('id, name, code, parent_id, is_group').order('name'),
+        supabase.from('bus_seat_config').select('id, name, total_capacity').order('name'),
+        supabase.from('amenities').select('id, name, icon').order('name')
+      ]);
+
+      if (busesRes.error) throw busesRes.error;
+      if (companiesRes.error) throw companiesRes.error;
+      if (seatConfigsRes.error) throw seatConfigsRes.error;
+      if (amenitiesRes.error) throw amenitiesRes.error;
+
+      setBuses(busesRes.data || []);
+      setCompanies(companiesRes.data || []);
+      setSeatConfigs(seatConfigsRes.data || []);
+      setAmenities(amenitiesRes.data || []);
+    } catch (error: any) {
+      toast.error('Erreur de chargement');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleNew = () => {
+    setEditingId(null);
+    setWizardInitialData(emptyGeneralData());
+    setExistingBusConfig(undefined);
+    setShowWizard(true);
+  };
+
+  const handleEdit = async (bus: BusData) => {
+    setEditingId(bus.id);
+    setWizardInitialData({
+      registration_number: bus.registration_number,
+      brand: bus.brand,
+      model: bus.model,
+      year: bus.year,
+      class: bus.class,
+      company_id: bus.company_id,
+      fuel_type: bus.fuel_type,
+      fuel_capacity: bus.fuel_capacity,
+      fuel_consumption: bus.fuel_consumption,
+      insurance_expiry: bus.insurance_expiry || '',
+      vignette_expiry: bus.vignette_expiry || '',
+      technical_inspection_expiry: bus.technical_inspection_expiry || '',
+      photo_url: bus.photo_url || '',
+      amenities: bus.amenities || [],
+    });
+
+    const deckType = (bus.bus_deck_type === 'imperial' ? 'imperial' : 'simple') as 'simple' | 'imperial';
+    const driverPos = (bus.driver_position === 'droite' ? 'droite' : 'gauche') as 'gauche' | 'droite';
+    const sleepingType = (bus.sleeping_type === 'couchettes' ? 'couchettes' : bus.sleeping_type === 'mixte' ? 'mixte' : 'aucun') as 'aucun' | 'couchettes' | 'mixte';
+
+    if (deckType === 'simple' && bus.bus_seat_config) {
+      const cfg = bus.bus_seat_config;
+      const aisleAfterColumns: number[] = Array.isArray(cfg.aisle_after_columns) ? cfg.aisle_after_columns : (cfg.aisle_position ? [cfg.aisle_position] : [2]);
+      const totalCols = cfg.total_columns ?? (cfg.left_columns + cfg.right_columns + aisleAfterColumns.length);
+      const hasBackRow = cfg.has_back_row ?? cfg.back_row ?? false;
+      setExistingBusConfig({
+        deckType: 'simple',
+        driverPosition: driverPos,
+        sleepingType,
+        maxCapacity: bus.max_allowed_capacity ?? bus.capacity,
+        aisleAfterColumns,
+        hasBackRow,
+        backRowSeats: cfg.back_row_seats ?? 0,
+        totalRows: cfg.rows ?? 10,
+        totalCols,
+        seatConfigId: cfg.id,
+        simpleLayout: cfg.grid_layout ?? null,
+      });
+    } else if (deckType === 'imperial' && bus.lower_deck_config_id && bus.upper_deck_config_id) {
+      try {
+        const [lowerRes, upperRes] = await Promise.all([
+          supabase.from('bus_seat_config').select('id, rows, left_columns, right_columns, back_row, has_back_row, back_row_seats, aisle_after_columns, total_columns, driver_position, grid_layout').eq('id', bus.lower_deck_config_id).maybeSingle(),
+          supabase.from('bus_seat_config').select('id, rows, left_columns, right_columns, back_row, has_back_row, back_row_seats, aisle_after_columns, total_columns, driver_position, grid_layout').eq('id', bus.upper_deck_config_id).maybeSingle(),
+        ]);
+        const lower = lowerRes.data;
+        const upper = upperRes.data;
+        const aisleAfterColumns: number[] = lower && Array.isArray(lower.aisle_after_columns) ? lower.aisle_after_columns : [2];
+        const totalCols = lower?.total_columns ?? ((lower?.left_columns ?? 2) + (lower?.right_columns ?? 2) + aisleAfterColumns.length);
+        const hasBackRow = lower?.has_back_row ?? lower?.back_row ?? false;
+        setExistingBusConfig({
+          deckType: 'imperial',
+          driverPosition: driverPos,
+          sleepingType,
+          maxCapacity: bus.max_allowed_capacity ?? bus.capacity,
+          aisleAfterColumns,
+          hasBackRow,
+          backRowSeats: lower?.back_row_seats ?? 0,
+          totalRows: lower?.rows ?? 10,
+          totalCols,
+          lowerConfigId: bus.lower_deck_config_id,
+          upperConfigId: bus.upper_deck_config_id,
+          lowerLayout: lower?.grid_layout ?? null,
+          upperLayout: upper?.grid_layout ?? null,
+        });
+      } catch {
+        setExistingBusConfig(undefined);
+      }
+    } else {
+      setExistingBusConfig(undefined);
+    }
+
+    setShowWizard(true);
+  };
+
+  const hasSeatPlan = (bus: BusData): boolean => {
+    const cfg = bus.bus_seat_config;
+    if (!cfg) return false;
+    if (Array.isArray(cfg.seat_layout) && cfg.seat_layout.length > 0) return true;
+    return false;
+  };
+
+  const repairSeatPlan = async (bus: BusData) => {
+    if (!bus.bus_seat_config) {
+      toast.error('Aucune configuration de siège trouvée pour ce bus');
+      return;
+    }
+    setRepairingId(bus.id);
+    try {
+      const cfg = bus.bus_seat_config;
+      const rows = cfg.rows || 10;
+      const leftCols = cfg.left_columns || 2;
+      const rightCols = cfg.right_columns || 2;
+      const hasBack = cfg.back_row || false;
+      const backSeats = cfg.back_row_seats || 0;
+
+      const layout = generateSeatLayout(rows, leftCols, rightCols, hasBack, backSeats);
+      const totalSeats = layout.flatMap(r => r.seats).length;
+
+      const { error } = await supabase
+        .from('bus_seat_config')
+        .update({
+          seat_layout: layout,
+          total_seats: totalSeats,
+          total_capacity: totalSeats,
+          left_columns: leftCols,
+          right_columns: rightCols,
+          aisle_position: leftCols,
+          generated_at: new Date().toISOString(),
+        })
+        .eq('id', cfg.id);
+
+      if (error) throw error;
+
+      await supabase
+        .from('buses')
+        .update({ capacity: totalSeats, total_seats: totalSeats })
+        .eq('id', bus.id);
+
+      toast.success(`Plan de sièges généré : ${totalSeats} places (${rows} rangées × ${leftCols + rightCols} colonnes)`);
+      loadData();
+    } catch (err: any) {
+      toast.error(`Erreur : ${err.message}`);
+    } finally {
+      setRepairingId(null);
+    }
+  };
+
+  const getExpiryAlert = (expiryDate: string) => {
+    if (!expiryDate) return null;
+    const daysUntilExpiry = Math.ceil((new Date(expiryDate).getTime() - new Date().getTime()) / (1000 * 60 * 60 * 24));
+    if (daysUntilExpiry < 0) return { color: 'var(--danger)', text: 'Expiré' };
+    if (daysUntilExpiry <= 30) return { color: 'var(--warning)', text: `${daysUntilExpiry}j restants` };
+    return null;
+  };
+
+  const filteredBuses = buses.filter(bus => {
+    if (filters.company && bus.company_id !== filters.company) return false;
+    if (filters.class && bus.class !== filters.class) return false;
+    if (filters.status && bus.status !== filters.status) return false;
+    if (filters.search) {
+      const search = filters.search.toLowerCase();
+      return (
+        bus.registration_number.toLowerCase().includes(search) ||
+        bus.brand.toLowerCase().includes(search) ||
+        bus.model.toLowerCase().includes(search)
+      );
+    }
+    return true;
+  });
+
+  const getClassBadgeColor = (className: string) => {
+    switch (className) {
+      case 'standard': return 'var(--neutral-600)';
+      case 'vip': return 'var(--warning)';
+      case 'executive': return 'var(--primary)';
+      default: return 'var(--neutral-600)';
+    }
+  };
+
+  if (loading) {
+    return <div className="p-8">Chargement...</div>;
+  }
+
+  return (
+    <div className="p-8">
+      <div className="flex justify-between items-center mb-8">
+        <div>
+          <h1 className="text-3xl font-bold mb-2" style={{ color: 'var(--text-primary)' }}>
+            Gestion des bus
+          </h1>
+          <p style={{ color: 'var(--text-secondary)' }}>
+            {buses.length} bus au total
+          </p>
+        </div>
+        <button
+          onClick={handleNew}
+          className="px-6 py-3 rounded-lg flex items-center gap-2 text-white font-medium"
+          style={{ backgroundColor: 'var(--primary)' }}
+        >
+          <Plus className="w-5 h-5" />
+          Nouveau bus
+        </button>
+      </div>
+
+      <div className="bg-white rounded-xl p-6 mb-6 border">
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+          <div className="relative">
+            <Search className="w-5 h-5 absolute left-3 top-1/2 -translate-y-1/2" style={{ color: 'var(--text-secondary)' }} />
+            <input
+              type="text"
+              placeholder="Rechercher..."
+              value={filters.search}
+              onChange={(e) => setFilters({ ...filters, search: e.target.value })}
+              className="w-full pl-10 pr-4 py-2 border rounded-lg"
+            />
+          </div>
+
+          <select
+            value={filters.company}
+            onChange={(e) => setFilters({ ...filters, company: e.target.value })}
+            className="px-4 py-2 border rounded-lg"
+          >
+            <option value="">Toutes les sociétés</option>
+            {companies.map(company => (
+              <option key={company.id} value={company.id}>{company.name}</option>
+            ))}
+          </select>
+
+          <select
+            value={filters.class}
+            onChange={(e) => setFilters({ ...filters, class: e.target.value })}
+            className="px-4 py-2 border rounded-lg"
+          >
+            <option value="">Toutes les classes</option>
+            <option value="standard">Standard</option>
+            <option value="vip">VIP</option>
+            <option value="executive">Executive</option>
+          </select>
+
+          <select
+            value={filters.status}
+            onChange={(e) => setFilters({ ...filters, status: e.target.value })}
+            className="px-4 py-2 border rounded-lg"
+          >
+            <option value="">Tous les statuts</option>
+            <option value="disponible">Disponible</option>
+            <option value="en_service">En service</option>
+            <option value="maintenance">Maintenance</option>
+            <option value="hors_service">Hors service</option>
+            <option value="panne_route">Panne route</option>
+            <option value="diagnostic">Diagnostic</option>
+            <option value="attente_ot">Attente OT</option>
+            <option value="controle_qualite">Contrôle qualité</option>
+          </select>
+        </div>
+      </div>
+
+      <div className="bg-white rounded-xl border overflow-hidden">
+        <table className="w-full">
+          <thead style={{ backgroundColor: 'var(--neutral-100)' }}>
+            <tr>
+              <th className="text-left p-4 font-semibold">Immatriculation</th>
+              <th className="text-left p-4 font-semibold">Marque/Modèle</th>
+              <th className="text-left p-4 font-semibold">Année</th>
+              <th className="text-left p-4 font-semibold">Classe</th>
+              <th className="text-left p-4 font-semibold">Société</th>
+              <th className="text-left p-4 font-semibold">Capacité</th>
+              <th className="text-left p-4 font-semibold">Plan de sièges</th>
+              <th className="text-left p-4 font-semibold">Statut</th>
+              <th className="text-left p-4 font-semibold">Taux remplissage</th>
+              <th className="text-left p-4 font-semibold">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filteredBuses.map((bus) => (
+              <tr key={bus.id} className="border-t hover:bg-gray-50">
+                <td className="p-4">
+                  <span className="font-bold">{bus.registration_number}</span>
+                </td>
+                <td className="p-4">{bus.brand} {bus.model}</td>
+                <td className="p-4">{bus.year}</td>
+                <td className="p-4">
+                  <span
+                    className="px-3 py-1 rounded-full text-xs font-medium text-white"
+                    style={{ backgroundColor: getClassBadgeColor(bus.class) }}
+                  >
+                    {bus.class.toUpperCase()}
+                  </span>
+                </td>
+                <td className="p-4">{bus.companies?.name}</td>
+                <td className="p-4">{bus.capacity} pl</td>
+                <td className="p-4">
+                  {hasSeatPlan(bus) ? (
+                    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium"
+                          style={{ backgroundColor: '#DCFCE7', color: '#16A34A' }}>
+                      <LayoutGrid className="w-3.5 h-3.5" />
+                      Configuré
+                    </span>
+                  ) : (
+                    <button
+                      onClick={() => repairSeatPlan(bus)}
+                      disabled={repairingId === bus.id}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium transition-colors hover:opacity-80 disabled:opacity-50"
+                      style={{ backgroundColor: '#FEF3C7', color: '#D97706' }}
+                      title="Générer le plan de sièges"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${repairingId === bus.id ? 'animate-spin' : ''}`} />
+                      {repairingId === bus.id ? 'Génération...' : 'Générer plan'}
+                    </button>
+                  )}
+                </td>
+                <td className="p-4">
+                  <StatusBadge status={bus.status} />
+                </td>
+                <td className="p-4">
+                  <div style={{ minWidth: '200px' }}>
+                    <FillRateBar
+                      current={Math.round((bus.fill_rate_current / 100) * bus.capacity)}
+                      total={bus.capacity}
+                      showLabel={false}
+                      size="sm"
+                    />
+                  </div>
+                </td>
+                <td className="p-4">
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => setViewingBus(bus)}
+                      className="p-2 hover:bg-gray-100 rounded-lg"
+                      title="Voir fiche"
+                    >
+                      <Eye className="w-4 h-4" style={{ color: 'var(--primary)' }} />
+                    </button>
+                    <button
+                      onClick={() => handleEdit(bus)}
+                      className="p-2 hover:bg-gray-100 rounded-lg"
+                      title="Modifier"
+                    >
+                      <Edit2 className="w-4 h-4" style={{ color: 'var(--primary)' }} />
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+
+        {filteredBuses.length === 0 && (
+          <div className="text-center py-12">
+            <Bus className="w-16 h-16 mx-auto mb-4" style={{ color: 'var(--neutral-400)' }} />
+            <p style={{ color: 'var(--text-secondary)' }}>Aucun bus trouvé</p>
+          </div>
+        )}
+      </div>
+
+      {showWizard && (
+        <BusWizard
+          editingId={editingId}
+          initialGeneralData={wizardInitialData}
+          companies={companies}
+          seatConfigs={seatConfigs}
+          amenities={amenities}
+          existingConfig={existingBusConfig}
+          onClose={() => { setShowWizard(false); setEditingId(null); setExistingBusConfig(undefined); }}
+          onSaved={loadData}
+        />
+      )}
+
+      {viewingBus && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4 overflow-y-auto">
+          <div className="bg-white rounded-xl w-full max-w-4xl my-8">
+            <div className="p-6 border-b flex justify-between items-center">
+              <div>
+                <h2 className="text-2xl font-bold mb-1">{viewingBus.registration_number}</h2>
+                <p style={{ color: 'var(--text-secondary)' }}>
+                  {viewingBus.brand} {viewingBus.model} ({viewingBus.year})
+                </p>
+              </div>
+              <button onClick={() => setViewingBus(null)}>
+                <Bus className="w-6 h-6" />
+              </button>
+            </div>
+
+            <div className="p-6">
+              <div className="grid grid-cols-2 gap-6 mb-6">
+                <div>
+                  <h3 className="font-semibold mb-2">Informations générales</h3>
+                  <div className="space-y-2 text-sm">
+                    <div className="flex justify-between">
+                      <span style={{ color: 'var(--text-secondary)' }}>Société:</span>
+                      <span className="font-medium">{viewingBus.companies?.name}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span style={{ color: 'var(--text-secondary)' }}>Classe:</span>
+                      <span className="font-medium">{viewingBus.class}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span style={{ color: 'var(--text-secondary)' }}>Capacité:</span>
+                      <span className="font-medium">{viewingBus.capacity} places</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span style={{ color: 'var(--text-secondary)' }}>Configuration:</span>
+                      <span className="font-medium">{viewingBus.bus_seat_config?.name || '—'}</span>
+                    </div>
+                    <div className="flex justify-between items-center">
+                      <span style={{ color: 'var(--text-secondary)' }}>Plan de sièges:</span>
+                      {hasSeatPlan(viewingBus) ? (
+                        <span className="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full"
+                              style={{ backgroundColor: '#DCFCE7', color: '#16A34A' }}>
+                          <LayoutGrid className="w-3 h-3" />
+                          Généré ({viewingBus.bus_seat_config?.total_capacity} places)
+                        </span>
+                      ) : (
+                        <button
+                          onClick={() => repairSeatPlan(viewingBus)}
+                          disabled={repairingId === viewingBus.id}
+                          className="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full transition-colors"
+                          style={{ backgroundColor: '#FEF3C7', color: '#D97706' }}
+                        >
+                          <RefreshCw className={`w-3 h-3 ${repairingId === viewingBus.id ? 'animate-spin' : ''}`} />
+                          {repairingId === viewingBus.id ? 'En cours...' : 'Générer maintenant'}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                <div>
+                  <h3 className="font-semibold mb-2">Carburant</h3>
+                  <div className="space-y-2 text-sm">
+                    <div className="flex justify-between">
+                      <span style={{ color: 'var(--text-secondary)' }}>Type:</span>
+                      <span className="font-medium">{viewingBus.fuel_type}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span style={{ color: 'var(--text-secondary)' }}>Capacité:</span>
+                      <span className="font-medium">{viewingBus.fuel_capacity}L</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span style={{ color: 'var(--text-secondary)' }}>Consommation:</span>
+                      <span className="font-medium">{viewingBus.fuel_consumption}L/100km</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="mb-6">
+                <h3 className="font-semibold mb-3">Taux de remplissage actuel</h3>
+                <FillRateBar
+                  current={Math.round((viewingBus.fill_rate_current / 100) * viewingBus.capacity)}
+                  total={viewingBus.capacity}
+                  size="lg"
+                />
+              </div>
+
+              <div className="mb-6">
+                <h3 className="font-semibold mb-3">Documents</h3>
+                <div className="grid grid-cols-3 gap-4">
+                  {[
+                    { label: 'Assurance', value: viewingBus.insurance_expiry },
+                    { label: 'Vignette', value: viewingBus.vignette_expiry },
+                    { label: 'Visite technique', value: viewingBus.technical_inspection_expiry },
+                  ].map(doc => (
+                    <div key={doc.label} className="p-4 rounded-lg border">
+                      <div className="flex items-center gap-2 mb-2">
+                        <Calendar className="w-4 h-4" />
+                        <span className="text-sm font-medium">{doc.label}</span>
+                      </div>
+                      <p className="text-sm">{doc.value || 'Non renseigné'}</p>
+                      {getExpiryAlert(doc.value) && (
+                        <div className="flex items-center gap-1 mt-2">
+                          <AlertTriangle className="w-4 h-4" style={{ color: getExpiryAlert(doc.value)!.color }} />
+                          <span className="text-xs" style={{ color: getExpiryAlert(doc.value)!.color }}>
+                            {getExpiryAlert(doc.value)!.text}
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <button
+                onClick={() => setViewingBus(null)}
+                className="w-full py-3 rounded-lg border font-medium"
+              >
+                Fermer
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
